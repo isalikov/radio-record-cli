@@ -2,8 +2,10 @@ package ui
 
 import (
 	"fmt"
+	"net/url"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -165,26 +167,43 @@ func (m *Model) extractGenres() {
 func (m *Model) updateVisibleList() {
 	m.visibleList = []int{}
 
-	for i, s := range m.stations {
-		if m.showFavorites && !m.config.IsFavorite(s.ID) {
-			continue
-		}
-
-		if m.currentGenre >= 0 && m.currentGenre < len(m.allGenres) {
-			genreName := m.allGenres[m.currentGenre]
-			hasGenre := false
-			for _, g := range s.Genres {
-				if g.Name == genreName {
-					hasGenre = true
-					break
-				}
+	// На вкладке "Все" (currentGenre == -1) избранные станции идут первыми
+	if m.currentGenre == -1 && !m.showFavorites {
+		// Сначала добавляем избранные
+		for i, s := range m.stations {
+			if m.config.IsFavorite(s.ID) {
+				m.visibleList = append(m.visibleList, i)
 			}
-			if !hasGenre {
+		}
+		// Затем остальные
+		for i, s := range m.stations {
+			if !m.config.IsFavorite(s.ID) {
+				m.visibleList = append(m.visibleList, i)
+			}
+		}
+	} else {
+		// Для других вкладок — стандартная логика
+		for i, s := range m.stations {
+			if m.showFavorites && !m.config.IsFavorite(s.ID) {
 				continue
 			}
-		}
 
-		m.visibleList = append(m.visibleList, i)
+			if m.currentGenre >= 0 && m.currentGenre < len(m.allGenres) {
+				genreName := m.allGenres[m.currentGenre]
+				hasGenre := false
+				for _, g := range s.Genres {
+					if g.Name == genreName {
+						hasGenre = true
+						break
+					}
+				}
+				if !hasGenre {
+					continue
+				}
+			}
+
+			m.visibleList = append(m.visibleList, i)
+		}
 	}
 
 	if m.cursor >= len(m.visibleList) {
@@ -263,6 +282,39 @@ func (m *Model) clearSearch() {
 	m.matchIndex = 0
 }
 
+// highlightMatch подсвечивает вхождения query в text
+func highlightMatch(text, query string, hlStyle lipgloss.Style) string {
+	if query == "" {
+		return text
+	}
+
+	textLower := strings.ToLower(text)
+	queryLower := strings.ToLower(query)
+
+	var result strings.Builder
+	lastEnd := 0
+
+	for {
+		idx := strings.Index(textLower[lastEnd:], queryLower)
+		if idx == -1 {
+			result.WriteString(text[lastEnd:])
+			break
+		}
+
+		start := lastEnd + idx
+		end := start + len(query)
+
+		// Добавляем текст до совпадения
+		result.WriteString(text[lastEnd:start])
+		// Добавляем подсвеченное совпадение
+		result.WriteString(hlStyle.Render(text[start:end]))
+
+		lastEnd = end
+	}
+
+	return result.String()
+}
+
 func (m *Model) playStation(stationIdx int) tea.Cmd {
 	if stationIdx < 0 || stationIdx >= len(m.stations) {
 		return nil
@@ -281,8 +333,8 @@ func (m *Model) getStationAtCursor() int {
 }
 
 func (m *Model) listHeight() int {
-	// header: 2, tabs: 1, separator: 1, status: 2, now playing: 4, footer: 1
-	reserved := 11
+	// header: 2, tabs: 1, separator: 1, status: 2, now playing: 7 (track + 3 links + borders), footer: 1
+	reserved := 14
 	if m.selected < 0 || m.nowPlaying == nil {
 		reserved = 7
 	}
@@ -424,17 +476,21 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			switch msg.String() {
 			case "enter":
 				m.mode = modeNormal
-				m.doSearch()
+				m.searchQuery = "" // Убираем подсветку при выходе из поиска
 			case "esc":
 				m.mode = modeNormal
 				m.clearSearch()
 			case "backspace":
 				if len(m.searchQuery) > 0 {
-					m.searchQuery = m.searchQuery[:len(m.searchQuery)-1]
+					// Корректное удаление UTF-8 символа (включая кириллицу)
+					runes := []rune(m.searchQuery)
+					m.searchQuery = string(runes[:len(runes)-1])
+					m.doSearch()
 				}
 			default:
-				if len(msg.String()) == 1 {
+				if utf8.RuneCountInString(msg.String()) == 1 {
 					m.searchQuery += msg.String()
+					m.doSearch()
 				}
 			}
 			return m, nil
@@ -516,7 +572,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			stationIdx := m.getStationAtCursor()
 			if stationIdx >= 0 {
 				m.config.ToggleFavorite(m.stations[stationIdx].ID)
-				if m.showFavorites {
+				// Обновляем список если в режиме избранного или на вкладке "Все" (где избранные вверху)
+				if m.showFavorites || m.currentGenre == -1 {
 					m.updateVisibleList()
 				}
 			}
@@ -602,8 +659,7 @@ func (m Model) View() string {
 
 	// Volume on the right
 	vol := m.player.Volume()
-	volBar := strings.Repeat("█", vol/10) + strings.Repeat("░", 10-vol/10)
-	volStr := volumeStyle.Render(fmt.Sprintf("🔊 %s %d%%", volBar, vol))
+	volStr := volumeStyle.Render(fmt.Sprintf("%d%%", vol))
 
 	titleLen := lipgloss.Width(title)
 	volLen := lipgloss.Width(volStr)
@@ -673,9 +729,12 @@ func (m Model) View() string {
 			}
 		}
 
+		// Номер станции (индекс из API, 1-based)
+		stationNum := dimStyle.Render(fmt.Sprintf("%3d. ", stationIdx+1))
+
 		// Truncate tooltip if needed
 		maxTitleLen := 20
-		maxTooltipLen := m.width - maxTitleLen - 15
+		maxTooltipLen := m.width - maxTitleLen - 20 // уменьшаем для номера станции
 		if maxTooltipLen < 10 {
 			maxTooltipLen = 10
 		}
@@ -685,7 +744,14 @@ func (m Model) View() string {
 			tooltip = tooltip[:maxTooltipLen-3] + "..."
 		}
 
-		line := fmt.Sprintf("%s%s%s%-*s %s", cursor, hotkey, favMark, maxTitleLen, station.Title, dimStyle.Render(tooltip))
+		// Подсветка совпадений при поиске
+		title := station.Title
+		if m.searchQuery != "" && m.isMatch(stationIdx) {
+			title = highlightMatch(station.Title, m.searchQuery, matchStyle)
+			tooltip = highlightMatch(tooltip, m.searchQuery, matchStyle)
+		}
+
+		line := fmt.Sprintf("%s%s%s%s%-*s %s", cursor, stationNum, hotkey, favMark, maxTitleLen, title, dimStyle.Render(tooltip))
 		listLines = append(listLines, style.Render(line))
 	}
 
@@ -727,7 +793,18 @@ func (m Model) View() string {
 			npContent = npContent[:maxNpLen-3] + "..."
 		}
 
-		np := nowPlayingStyle.Width(m.width - 4).Render(npContent)
+		// Music service links
+		query := url.QueryEscape(artist + " " + song)
+		ytLink := fmt.Sprintf("https://music.youtube.com/search?q=%s", query)
+		yaLink := fmt.Sprintf("https://music.yandex.ru/search?text=%s", query)
+		spLink := fmt.Sprintf("https://open.spotify.com/search/%s", query)
+
+		linksLine := dimStyle.Render(fmt.Sprintf("YT Music: %s", ytLink))
+		linksLine2 := dimStyle.Render(fmt.Sprintf("Yandex:   %s", yaLink))
+		linksLine3 := dimStyle.Render(fmt.Sprintf("Spotify:  %s", spLink))
+
+		npBox := npContent + "\n" + linksLine + "\n" + linksLine2 + "\n" + linksLine3
+		np := nowPlayingStyle.Width(m.width - 4).Render(npBox)
 		sections = append(sections, np)
 	}
 

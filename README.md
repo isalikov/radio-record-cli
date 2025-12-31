@@ -7,31 +7,34 @@ Terminal-based radio player for [Radio Record](https://www.radiorecord.ru/) stat
 ![Platform](https://img.shields.io/badge/Platform-macOS%20%7C%20Linux-lightgrey)
 
 ```
-📻 Radio Record CLI                                    🔊 ████████░░ 80%
+📻 Radio Record CLI                                                    80%
  Все   BASS  BREAKS  CHILL  DRUM  HARD  HOUSE  OLDSCHOOL  POP  RAP/URBAN
 ──────────────────────────────────────────────────────────────────────────
-▸ [1] ♥ Record              Танцевальный мейнстрим
-  [2] ♥ Deep                Глубокое house-звучание
-       Russian Mix          Русские хиты в танцевальной обработке
-  ♪    Chill-Out            Расслабляющий вайб
-       Megamix              Mash-up из главных хитов Рекорда
-       Remix                Иностранные хиты в танцевальной обработке
+▸   1. [1] ♥ Record            Танцевальный мейнстрим
+    2. [2] ♥ Deep              Глубокое house-звучание
+   15.      Russian Mix        Русские хиты в танцевальной обработке
+♪  23.      Chill-Out          Расслабляющий вайб
+   42.      Megamix            Mash-up из главных хитов Рекорда
+   56.      Remix              Иностранные хиты в танцевальной обработке
 ──────────────────────────────────────────────────────────────────────────
  4/117 станций
 ╭────────────────────────────────────────────────────────────────────────╮
 │ ▶ JOHN SUMMIT/INEZ — light years (Record Mix)                         │
+│ YT Music: https://music.youtube.com/search?q=...                      │
+│ Yandex:   https://music.yandex.ru/search?text=...                     │
+│ Spotify:  https://open.spotify.com/search/...                         │
 ╰────────────────────────────────────────────────────────────────────────╯
       ? справка │ / поиск │ ←Tab→ жанры │ 0 сброс │ f ♥ │ +/- 🔊 │ Enter ▶
 ```
 
 ## Features
 
-- 🎵 **117 radio stations** — all Radio Record stations
-- 🔍 **Vim-style search** — `/` to search, `n`/`N` to navigate matches
+- 🎵 **117 radio stations** — all Radio Record stations with permanent station numbers
+- 🔍 **Real-time search** — instant highlighting as you type, supports Cyrillic
 - 🎨 **Genre filter** — filter stations by genre with Tab
-- ♥ **Favorites** — save your favorite stations, access with `1-9` hotkeys
+- ♥ **Favorites** — save favorites, access with `1-9` hotkeys, shown first on "All" tab
 - 🔊 **Volume control** — adjust volume without leaving the app
-- 📺 **Now Playing** — see current track with auto-refresh
+- 📺 **Now Playing** — current track with links to YouTube Music, Yandex Music, Spotify
 - 📐 **Responsive UI** — adapts to terminal size
 - 💾 **Persistent config** — favorites and volume saved between sessions
 
@@ -54,16 +57,16 @@ yay -S radio-record-cli
 
 ```bash
 # Download .deb from releases
-wget https://github.com/isalikov/radio-record-cli/releases/latest/download/radio-record-cli_1.0.0_linux_amd64.deb
-sudo dpkg -i radio-record-cli_1.0.0_linux_amd64.deb
+wget https://github.com/isalikov/radio-record-cli/releases/latest/download/radio-record-cli_1.1.0_linux_amd64.deb
+sudo dpkg -i radio-record-cli_1.1.0_linux_amd64.deb
 ```
 
 ### Fedora/RHEL
 
 ```bash
 # Download .rpm from releases
-wget https://github.com/isalikov/radio-record-cli/releases/latest/download/radio-record-cli_1.0.0_linux_amd64.rpm
-sudo rpm -i radio-record-cli_1.0.0_linux_amd64.rpm
+wget https://github.com/isalikov/radio-record-cli/releases/latest/download/radio-record-cli_1.1.0_linux_amd64.rpm
+sudo rpm -i radio-record-cli_1.1.0_linux_amd64.rpm
 ```
 
 ### Manual
