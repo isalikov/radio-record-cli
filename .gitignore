@@ -1,0 +1,20 @@
+# Binary
+radio-record
+radio-record-cli
+
+# GoReleaser
+dist/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test
+coverage.out
+*.test

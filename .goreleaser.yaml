@@ -1,0 +1,71 @@
+version: 2
+
+project_name: radio-record-cli
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: radio-record
+    main: ./main.go
+    binary: radio-record
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - darwin
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+      - -X main.version={{.Version}}
+      - -X main.commit={{.ShortCommit}}
+      - -X main.date={{.Date}}
+
+archives:
+  - id: default
+    format: tar.gz
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - README.md
+      - LICENSE*
+
+checksum:
+  name_template: "checksums.txt"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - Merge pull request
+      - Merge branch
+
+brews:
+  - repository:
+      owner: isalikov
+      name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+    directory: Formula
+    homepage: "https://github.com/isalikov/radio-record-cli"
+    description: "Terminal radio player for Radio Record stations"
+    license: "MIT"
+    dependencies:
+      - name: mpv
+        type: required
+    install: |
+      bin.install "radio-record"
+    test: |
+      system "#{bin}/radio-record", "--version"
+
+release:
+  github:
+    owner: isalikov
+    name: radio-record-cli
+  draft: false
+  prerelease: auto
+  name_template: "v{{.Version}}"
