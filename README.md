@@ -57,16 +57,16 @@ yay -S radio-record-cli
 
 ```bash
 # Download .deb from releases
-wget https://github.com/isalikov/radio-record-cli/releases/latest/download/radio-record-cli_1.1.0_linux_amd64.deb
-sudo dpkg -i radio-record-cli_1.1.0_linux_amd64.deb
+wget https://github.com/isalikov/radio-record-cli/releases/latest/download/radio-record-cli_1.1.1_linux_amd64.deb
+sudo dpkg -i radio-record-cli_1.1.1_linux_amd64.deb
 ```
 
 ### Fedora/RHEL
 
 ```bash
 # Download .rpm from releases
-wget https://github.com/isalikov/radio-record-cli/releases/latest/download/radio-record-cli_1.1.0_linux_amd64.rpm
-sudo rpm -i radio-record-cli_1.1.0_linux_amd64.rpm
+wget https://github.com/isalikov/radio-record-cli/releases/latest/download/radio-record-cli_1.1.1_linux_amd64.rpm
+sudo rpm -i radio-record-cli_1.1.1_linux_amd64.rpm
 ```
 
 ### Manual

@@ -538,6 +538,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "enter", " ":
 			stationIdx := m.getStationAtCursor()
 			if stationIdx >= 0 {
+				// Toggle: если станция уже играет — останавливаем
+				if stationIdx == m.selected {
+					m.player.Stop()
+					m.selected = -1
+					m.nowPlaying = nil
+					return m, nil
+				}
 				return m, m.playStation(stationIdx)
 			}
 
