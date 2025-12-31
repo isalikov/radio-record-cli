@@ -62,6 +62,27 @@ brews:
     test: |
       system "#{bin}/radio-record", "--version"
 
+nfpms:
+  - id: packages
+    package_name: radio-record-cli
+    file_name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    vendor: Iakov Salikov
+    homepage: https://github.com/isalikov/radio-record-cli
+    maintainer: Iakov Salikov <me@isalikov.com>
+    description: Terminal radio player for Radio Record stations
+    license: MIT
+    formats:
+      - deb
+      - rpm
+    dependencies:
+      - mpv
+    bindir: /usr/bin
+    contents:
+      - src: LICENSE
+        dst: /usr/share/licenses/radio-record-cli/LICENSE
+      - src: README.md
+        dst: /usr/share/doc/radio-record-cli/README.md
+
 release:
   github:
     owner: isalikov

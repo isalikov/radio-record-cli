@@ -44,6 +44,28 @@ brew tap isalikov/tap
 brew install radio-record-cli
 ```
 
+### Arch Linux (AUR)
+
+```bash
+yay -S radio-record-cli
+```
+
+### Debian/Ubuntu
+
+```bash
+# Download .deb from releases
+wget https://github.com/isalikov/radio-record-cli/releases/latest/download/radio-record-cli_1.0.0_linux_amd64.deb
+sudo dpkg -i radio-record-cli_1.0.0_linux_amd64.deb
+```
+
+### Fedora/RHEL
+
+```bash
+# Download .rpm from releases
+wget https://github.com/isalikov/radio-record-cli/releases/latest/download/radio-record-cli_1.0.0_linux_amd64.rpm
+sudo rpm -i radio-record-cli_1.0.0_linux_amd64.rpm
+```
+
 ### Manual
 
 Download the latest binary from [Releases](https://github.com/isalikov/radio-record-cli/releases).
