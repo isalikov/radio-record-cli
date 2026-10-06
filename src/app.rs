@@ -36,7 +36,7 @@ impl Category {
 pub enum Action {
     None,
     Quit,
-    Play(String),
+    Play(Vec<String>),
     Pause,
     Stop,
     Volume(u8),
@@ -315,10 +315,15 @@ impl App {
         let Some(station) = self.selected_station().cloned() else {
             return Action::None;
         };
-        let Some(url) = station.stream_url().map(str::to_owned) else {
+        let urls: Vec<String> = station
+            .stream_urls()
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        if urls.is_empty() {
             self.error = Some("No stream available".into());
             return Action::None;
-        };
+        }
         self.now = Some(station);
         self.history.clear();
         self.history_error = None;
@@ -328,7 +333,7 @@ impl App {
             state: PlayerState::Buffering,
             ..Snapshot::default()
         };
-        Action::Play(url)
+        Action::Play(urls)
     }
 
     fn change_category(&mut self, direction: isize) {

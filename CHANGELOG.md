@@ -4,6 +4,10 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+- Fall back to the station's next stream (`stream_320` → `stream_hls` →
+  `stream_128` → `stream_64`) when one fails to load, instead of stopping with
+  `Stream unavailable: loading failed`. Fixes playback when the direct stream
+  host is unreachable but HLS works (e.g. behind a split-tunnel VPN).
 - Wait up to 20 seconds (was 5) for mpv to open its IPC socket, so a slow first
   launch of a freshly installed mpv on macOS no longer fails with
   `mpv IPC: No such file or directory`. The error now says how to retry.

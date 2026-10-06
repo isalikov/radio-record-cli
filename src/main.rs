@@ -144,8 +144,8 @@ fn run() -> Result<()> {
         player.update();
         app.playback = player.snapshot.clone();
         for direction in player.media_commands() {
-            if let Action::Play(url) = app.skip_station(direction) {
-                player.play(&url);
+            if let Action::Play(urls) = app.skip_station(direction) {
+                player.play(urls);
                 network.history(&mut app);
             }
         }
@@ -165,8 +165,8 @@ fn run() -> Result<()> {
             match event::read()? {
                 Event::Key(key) if key.kind != KeyEventKind::Release => match app.key(key) {
                     Action::Quit => break,
-                    Action::Play(url) => {
-                        player.play(&url);
+                    Action::Play(urls) => {
+                        player.play(urls);
                         network.history(&mut app);
                     }
                     Action::Pause => player.toggle_pause(),

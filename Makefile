@@ -25,7 +25,7 @@ test:
 	cargo test
 
 test-audio:
-	cargo test mpv_measures_real_audio_and_accepts_volume_and_pause -- --ignored
+	cargo test mpv_falls_back_measures_real_audio_and_accepts_volume_and_pause -- --ignored
 
 check:
 	cargo fmt --check

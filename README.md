@@ -75,6 +75,12 @@ fast. Running `mpv --version` once from the terminal after installing has the sa
 effect. If it keeps happening, check that `/tmp` is writable, since the IPC socket
 lives in a temporary directory there.
 
+**`Stream unavailable: loading failed`** — mpv could not open any of the station's
+streams. radiome already falls back from the direct streams to HLS, so this means
+none of them were reachable. A VPN or split-tunnel rule that routes the stream host
+(`radiorecord.hostingradio.ru`) badly is a common cause; check with
+`curl -sI https://radiorecord.hostingradio.ru/rr_main96.aacp`.
+
 ## Uninstall
 
 ```sh
@@ -157,7 +163,8 @@ Directory precedence: `RADIOME_CONFIG_DIR`, `$XDG_CONFIG_HOME/radiome`,
 History and current track metadata refresh every 15 seconds. The API may lag
 behind audio, especially after pausing. `RADIOME_BASE_URL` overrides the API
 base URL for development. Requests time out after 15 seconds.
-Stream priority: `stream_320`, `stream_hls`, `stream_128`, `stream_64`.
+Stream priority: `stream_320`, `stream_hls`, `stream_128`, `stream_64`. If a stream
+fails to load, the player tries the next distinct one before reporting an error.
 
 ## Verify
 

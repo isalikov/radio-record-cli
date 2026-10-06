@@ -91,14 +91,24 @@ pub struct Station {
 
 impl Station {
     pub fn stream_url(&self) -> Option<&str> {
-        [
+        self.stream_urls().into_iter().next()
+    }
+
+    // Every distinct stream in priority order; the player falls back down the list when
+    // a host is unreachable (stream_320/128/64 share one host, HLS lives on another).
+    pub fn stream_urls(&self) -> Vec<&str> {
+        let mut urls = Vec::new();
+        for candidate in [
             self.stream_320.as_str(),
             self.stream_hls.as_str(),
             self.stream_128.as_str(),
             self.stream_64.as_str(),
-        ]
-        .into_iter()
-        .find(|candidate| !candidate.is_empty())
+        ] {
+            if !candidate.is_empty() && !urls.contains(&candidate) {
+                urls.push(candidate);
+            }
+        }
+        urls
     }
 }
 
@@ -272,6 +282,18 @@ mod tests {
         assert_eq!(
             catalog.stations[0].stream_url(),
             Some("https://example.com/stream.mp3")
+        );
+        let mut station = catalog.stations[0].clone();
+        station.stream_hls = "https://example.com/playlist.m3u8".into();
+        station.stream_128 = station.stream_320.clone();
+        station.stream_64 = "https://example.com/stream64.aacp".into();
+        assert_eq!(
+            station.stream_urls(),
+            [
+                "https://example.com/stream.mp3",
+                "https://example.com/playlist.m3u8",
+                "https://example.com/stream64.aacp",
+            ]
         );
     }
 

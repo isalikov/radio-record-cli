@@ -35,7 +35,7 @@ pub struct Snapshot {
 }
 
 enum Request {
-    Play(u64, String),
+    Play(u64, Vec<String>),
     Pause,
     Stop(u64),
     Volume(u8),
@@ -66,13 +66,14 @@ impl Player {
             snapshot: Snapshot::default(),
         }
     }
-    pub fn play(&mut self, url: &str) {
+    // `urls` is in priority order; later entries are tried when earlier ones fail to load.
+    pub fn play(&mut self, urls: Vec<String>) {
         self.generation += 1;
         self.snapshot = Snapshot {
             state: PlayerState::Buffering,
             ..Snapshot::default()
         };
-        let _ = self.tx.send(Request::Play(self.generation, url.to_owned()));
+        let _ = self.tx.send(Request::Play(self.generation, urls));
     }
     pub fn toggle_pause(&self) {
         let _ = self.tx.send(Request::Pause);
@@ -124,7 +125,7 @@ fn worker(
                     engine.command(json!(["set_property", "volume", volume]));
                 }
             }
-            Ok(Request::Play(request_generation, url)) => {
+            Ok(Request::Play(request_generation, urls)) => {
                 generation = request_generation;
                 if engine.is_none() {
                     match Engine::new(volume, false) {
@@ -148,7 +149,8 @@ fn worker(
                     };
                     engine.paused = false;
                     engine.command(json!(["set_property", "pause", false]));
-                    engine.command(json!(["loadfile", url, "replace"]));
+                    engine.fallbacks = urls.into();
+                    engine.load_next();
                 }
             }
             Ok(Request::Pause) => {
@@ -188,6 +190,7 @@ fn worker(
 // mpv and IPC live on a worker so buffering never blocks keyboard input or rendering.
 struct Engine {
     media: Vec<isize>,
+    fallbacks: VecDeque<String>,
     meter: AudioMeter,
     meter_received: Instant,
     child: Child,
@@ -252,6 +255,7 @@ impl Engine {
             .map_err(|err| Error::new(format!("Could not start mpv: {err}")))?;
         Ok(Self {
             media: Vec::new(),
+            fallbacks: VecDeque::new(),
             meter: AudioMeter::default(),
             meter_received: Instant::now(),
             child,
@@ -264,6 +268,13 @@ impl Engine {
             paused: false,
             snapshot: Snapshot::default(),
         })
+    }
+    fn load_next(&mut self) -> bool {
+        let Some(url) = self.fallbacks.pop_front() else {
+            return false;
+        };
+        self.command(json!(["loadfile", url, "replace"]));
+        true
     }
     fn command(&mut self, command: Value) {
         self.request(command, 0);
@@ -376,6 +387,10 @@ impl Engine {
                 _ => {}
             },
             Some("end-file") if value["reason"] == "error" => {
+                if self.load_next() {
+                    self.snapshot.state = PlayerState::Buffering;
+                    return;
+                }
                 self.snapshot.state = PlayerState::Error;
                 self.snapshot.error = Some(format!(
                     "Stream unavailable: {}",
@@ -452,7 +467,7 @@ mod tests {
             worker: None,
             snapshot: Snapshot::default(),
         };
-        player.play("https://example.com/first");
+        player.play(vec!["https://example.com/first".into()]);
         updates
             .send((
                 1,
@@ -465,7 +480,7 @@ mod tests {
         player.stop();
         player.update();
         assert_eq!(player.snapshot.state, PlayerState::Idle);
-        player.play("https://example.com/second");
+        player.play(vec!["https://example.com/second".into()]);
         updates
             .send((
                 1,
@@ -515,13 +530,14 @@ mod tests {
     }
     #[test]
     #[ignore = "requires mpv and local Unix sockets; uses silent audio output"]
-    fn mpv_measures_real_audio_and_accepts_volume_and_pause() {
+    fn mpv_falls_back_measures_real_audio_and_accepts_volume_and_pause() {
         let mut engine = Engine::new(65, true).unwrap();
-        engine.command(json!([
-            "loadfile",
-            "av://lavfi:sine=frequency=440:sample_rate=44100",
-            "replace"
-        ]));
+        // The first stream cannot be opened, so the engine must fall back to the second.
+        engine.fallbacks = VecDeque::from([
+            "/nonexistent/radiome-stream.aacp".to_owned(),
+            "av://lavfi:sine=frequency=440:sample_rate=44100".to_owned(),
+        ]);
+        engine.load_next();
         let deadline = Instant::now() + Duration::from_secs(8);
         while Instant::now() < deadline {
             engine.tick().unwrap();
