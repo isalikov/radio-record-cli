@@ -15,6 +15,10 @@ const TICK: Duration = Duration::from_millis(50);
 // installed mpv can take well over five seconds on macOS while the system verifies
 // the binary and its libraries; later launches take a fraction of a second.
 const IPC_STARTUP_GRACE: Duration = Duration::from_secs(20);
+// Rounds over a station's full stream list before giving up. Stream hosts sit behind
+// rotating DNS pools, so a later lookup can hand out an address the first one did not.
+const STREAM_ROUNDS: u32 = 3;
+const STREAM_RETRY_DELAY: Duration = Duration::from_secs(2);
 const METER: &str = "--af-add=@radiome_meter:lavfi=[astats=metadata=1:reset=1:measure_perchannel=none:measure_overall=RMS_level]";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -149,8 +153,10 @@ fn worker(
                     };
                     engine.paused = false;
                     engine.command(json!(["set_property", "pause", false]));
-                    engine.fallbacks = urls.into();
-                    engine.load_next();
+                    engine.streams = Streams::new(urls);
+                    if let Some(url) = engine.streams.next() {
+                        engine.load(&url);
+                    }
                 }
             }
             Ok(Request::Pause) => {
@@ -190,7 +196,7 @@ fn worker(
 // mpv and IPC live on a worker so buffering never blocks keyboard input or rendering.
 struct Engine {
     media: Vec<isize>,
-    fallbacks: VecDeque<String>,
+    streams: Streams,
     meter: AudioMeter,
     meter_received: Instant,
     child: Child,
@@ -255,7 +261,7 @@ impl Engine {
             .map_err(|err| Error::new(format!("Could not start mpv: {err}")))?;
         Ok(Self {
             media: Vec::new(),
-            fallbacks: VecDeque::new(),
+            streams: Streams::default(),
             meter: AudioMeter::default(),
             meter_received: Instant::now(),
             child,
@@ -269,12 +275,8 @@ impl Engine {
             snapshot: Snapshot::default(),
         })
     }
-    fn load_next(&mut self) -> bool {
-        let Some(url) = self.fallbacks.pop_front() else {
-            return false;
-        };
+    fn load(&mut self, url: &str) {
         self.command(json!(["loadfile", url, "replace"]));
-        true
     }
     fn command(&mut self, command: Value) {
         self.request(command, 0);
@@ -308,6 +310,9 @@ impl Engine {
                     )));
                 }
             }
+        }
+        if let Some(url) = self.streams.due(Instant::now()) {
+            self.load(&url);
         }
         if self.metered.elapsed() >= TICK {
             self.request(json!(["get_property", "af-metadata/radiome_meter"]), 10);
@@ -387,15 +392,18 @@ impl Engine {
                 _ => {}
             },
             Some("end-file") if value["reason"] == "error" => {
-                if self.load_next() {
-                    self.snapshot.state = PlayerState::Buffering;
-                    return;
+                let error = value["file_error"].as_str().unwrap_or("mpv error");
+                match self.streams.fail(error, Instant::now()) {
+                    Failure::Load(url) => {
+                        self.load(&url);
+                        self.snapshot.state = PlayerState::Buffering;
+                    }
+                    Failure::Wait => self.snapshot.state = PlayerState::Buffering,
+                    Failure::GiveUp(message) => {
+                        self.snapshot.state = PlayerState::Error;
+                        self.snapshot.error = Some(message);
+                    }
                 }
-                self.snapshot.state = PlayerState::Error;
-                self.snapshot.error = Some(format!(
-                    "Stream unavailable: {}",
-                    value["file_error"].as_str().unwrap_or("mpv error")
-                ));
             }
             Some("end-file") if value["reason"] == "eof" => self.snapshot.state = PlayerState::Idle,
             _ => {}
@@ -405,6 +413,82 @@ impl Engine {
             self.meter_received = Instant::now();
         }
     }
+}
+
+// The current station's streams in priority order. A failed stream falls through to the
+// next one; when the list runs out it is retried after a pause, up to STREAM_ROUNDS times.
+#[derive(Default)]
+struct Streams {
+    urls: Vec<String>,
+    queue: VecDeque<String>,
+    current: Option<String>,
+    unreachable: Vec<String>,
+    round: u32,
+    retry_at: Option<Instant>,
+}
+
+enum Failure {
+    Load(String),
+    Wait,
+    GiveUp(String),
+}
+
+impl Streams {
+    fn new(urls: Vec<String>) -> Self {
+        Self {
+            queue: urls.iter().cloned().collect(),
+            urls,
+            ..Self::default()
+        }
+    }
+    fn next(&mut self) -> Option<String> {
+        let url = self.queue.pop_front()?;
+        self.current = Some(url.clone());
+        Some(url)
+    }
+    fn fail(&mut self, error: &str, now: Instant) -> Failure {
+        if self.retry_at.is_some() {
+            return Failure::Wait;
+        }
+        if let Some(url) = self.current.take() {
+            let host = host(&url).to_owned();
+            if !self.unreachable.contains(&host) {
+                self.unreachable.push(host);
+            }
+        }
+        if let Some(url) = self.next() {
+            return Failure::Load(url);
+        }
+        if self.round + 1 < STREAM_ROUNDS && !self.urls.is_empty() {
+            self.round += 1;
+            self.queue = self.urls.iter().cloned().collect();
+            self.retry_at = Some(now + STREAM_RETRY_DELAY);
+            return Failure::Wait;
+        }
+        Failure::GiveUp(
+            if error == "loading failed" && !self.unreachable.is_empty() {
+                format!(
+                    "{} unreachable · Enter to retry",
+                    self.unreachable.join(", ")
+                )
+            } else {
+                format!("Stream unavailable: {error} · Enter to retry")
+            },
+        )
+    }
+    fn due(&mut self, now: Instant) -> Option<String> {
+        if self.retry_at.is_none_or(|at| now < at) {
+            return None;
+        }
+        self.retry_at = None;
+        self.unreachable.clear();
+        self.next()
+    }
+}
+
+fn host(url: &str) -> &str {
+    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+    rest.split(['/', ':', '?']).next().unwrap_or(rest)
 }
 
 #[derive(Default)]
@@ -494,6 +578,48 @@ mod tests {
         assert_eq!(player.snapshot.state, PlayerState::Buffering);
     }
     #[test]
+    fn streams_fall_back_retry_and_name_unreachable_hosts() {
+        let mut streams = Streams::new(vec![
+            "https://a.example.com/96.aacp".into(),
+            "https://hls.example.com:443/playlist.m3u8".into(),
+        ]);
+        let mut now = Instant::now();
+        let mut first = streams.next();
+        for round in 1..=STREAM_ROUNDS {
+            assert_eq!(first.as_deref(), Some("https://a.example.com/96.aacp"));
+            assert!(
+                matches!(streams.fail("loading failed", now), Failure::Load(url) if url.contains("hls"))
+            );
+            if round == STREAM_ROUNDS {
+                break;
+            }
+            assert!(matches!(streams.fail("loading failed", now), Failure::Wait));
+            // A late error while waiting must not cut the pause short.
+            assert!(matches!(streams.fail("loading failed", now), Failure::Wait));
+            assert_eq!(streams.due(now), None);
+            now += STREAM_RETRY_DELAY;
+            first = streams.due(now);
+        }
+        match streams.fail("loading failed", now) {
+            Failure::GiveUp(message) => assert_eq!(
+                message,
+                "a.example.com, hls.example.com unreachable · Enter to retry"
+            ),
+            _ => panic!("must give up after the last round"),
+        }
+
+        let mut streams = Streams::new(vec!["https://a.example.com/x".into()]);
+        streams.round = STREAM_ROUNDS - 1;
+        streams.next();
+        match streams.fail("unrecognized file format", now) {
+            Failure::GiveUp(message) => assert_eq!(
+                message,
+                "Stream unavailable: unrecognized file format · Enter to retry"
+            ),
+            _ => panic!("must give up after the last round"),
+        }
+    }
+    #[test]
     fn meter_rejects_missing_and_non_finite_levels() {
         let mut meter = AudioMeter::default();
         for value in ["-inf", "NaN", "inf", "broken"] {
@@ -533,11 +659,12 @@ mod tests {
     fn mpv_falls_back_measures_real_audio_and_accepts_volume_and_pause() {
         let mut engine = Engine::new(65, true).unwrap();
         // The first stream cannot be opened, so the engine must fall back to the second.
-        engine.fallbacks = VecDeque::from([
+        engine.streams = Streams::new(vec![
             "/nonexistent/radiome-stream.aacp".to_owned(),
             "av://lavfi:sine=frequency=440:sample_rate=44100".to_owned(),
         ]);
-        engine.load_next();
+        let url = engine.streams.next().unwrap();
+        engine.load(&url);
         let deadline = Instant::now() + Duration::from_secs(8);
         while Instant::now() < deadline {
             engine.tick().unwrap();

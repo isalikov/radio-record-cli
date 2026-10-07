@@ -75,11 +75,15 @@ fast. Running `mpv --version` once from the terminal after installing has the sa
 effect. If it keeps happening, check that `/tmp` is writable, since the IPC socket
 lives in a temporary directory there.
 
-**`Stream unavailable: loading failed`** — mpv could not open any of the station's
-streams. radiome already falls back from the direct streams to HLS, so this means
-none of them were reachable. A VPN or split-tunnel rule that routes the stream host
-(`radiorecord.hostingradio.ru`) badly is a common cause; check with
-`curl -sI https://radiorecord.hostingradio.ru/rr_main96.aacp`.
+**`<host> unreachable · Enter to retry`** — mpv could not open any of the station's
+streams. radiome falls back from the direct streams to HLS and then retries the whole
+list two more times, 2 seconds apart, before showing this; the message names the
+hosts that failed. The HLS host is a rotating DNS pool, so a retry can land on an
+address that works. A VPN or split-tunnel rule that sends some of these addresses
+around the tunnel is a common cause: route `*.hostingradio.ru` and `*.magonet.ru`
+through the VPN, or check with
+`curl -sI https://radiorecord.hostingradio.ru/rr_main96.aacp`. Other mpv errors are
+shown as `Stream unavailable: <reason>`.
 
 ## Uninstall
 

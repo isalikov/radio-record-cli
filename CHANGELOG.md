@@ -8,6 +8,10 @@ All notable changes to this project are documented here.
   `stream_128` → `stream_64`) when one fails to load, instead of stopping with
   `Stream unavailable: loading failed`. Fixes playback when the direct stream
   host is unreachable but HLS works (e.g. behind a split-tunnel VPN).
+- When every stream of a station fails, retry the whole list up to two more times,
+  2 seconds apart, so rotating DNS pools get a chance to return a reachable address.
+- The final stream error names the hosts that could not be reached
+  (`<host> unreachable · Enter to retry`) instead of `loading failed`.
 - Wait up to 20 seconds (was 5) for mpv to open its IPC socket, so a slow first
   launch of a freshly installed mpv on macOS no longer fails with
   `mpv IPC: No such file or directory`. The error now says how to retry.
