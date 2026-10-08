@@ -135,14 +135,27 @@ fn run() -> Result<()> {
     let mut app = App::new(settings);
     let mut network = Network::new();
     network.catalog(&mut app);
+    let theme = ui::theme_from_env();
     let mut terminal = ratatui::try_init()?;
     let _guard = TerminalGuard;
     let mut last_frame = Instant::now();
     let mut last_save = Instant::now();
+    let started = Instant::now();
     loop {
         network.poll(&mut app);
         player.update();
         app.playback = player.snapshot.clone();
+        app.generation = player.generation();
+        app.worker_stalled = player.worker_stalled();
+        if app.worker_stalled {
+            app.error = Some("Player engine stalled · q quit".into());
+        }
+        app.uptime = started.elapsed();
+        app.history_age = if app.now.is_some() {
+            Some(network.history_updated.elapsed())
+        } else {
+            None
+        };
         for direction in player.media_commands() {
             if let Action::Play(urls) = app.skip_station(direction) {
                 player.play(urls);
@@ -150,7 +163,8 @@ fn run() -> Result<()> {
             }
         }
         if last_frame.elapsed() >= Duration::from_millis(50) {
-            terminal.draw(|frame| ui::render(frame, &mut app))?;
+            app.push_meter_sample();
+            terminal.draw(|frame| ui::render(frame, &mut app, &theme))?;
             last_frame = Instant::now();
         }
         if app.dirty && last_save.elapsed() >= Duration::from_millis(500) {
@@ -182,7 +196,7 @@ fn run() -> Result<()> {
                     Action::None => {}
                 },
                 Event::Resize(_, _) => {
-                    terminal.draw(|frame| ui::render(frame, &mut app))?;
+                    terminal.draw(|frame| ui::render(frame, &mut app, &theme))?;
                 }
                 _ => {}
             }

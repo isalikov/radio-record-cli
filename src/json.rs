@@ -2,6 +2,11 @@ use std::collections::BTreeMap;
 
 use crate::error::{Error, Result};
 
+// Deeply nested input would recurse until the stack overflows, which aborts the
+// process without unwinding and leaves the terminal in raw mode. serde_json uses
+// the same default limit.
+const MAX_DEPTH: usize = 128;
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum JsonValue {
     Null,
@@ -49,7 +54,11 @@ impl JsonValue {
 }
 
 pub fn parse(input: &str) -> Result<JsonValue> {
-    let mut parser = Parser { input, pos: 0 };
+    let mut parser = Parser {
+        input,
+        pos: 0,
+        depth: 0,
+    };
     let value = parser.parse_value()?;
     parser.skip_ws();
     if !parser.is_eof() {
@@ -61,6 +70,7 @@ pub fn parse(input: &str) -> Result<JsonValue> {
 struct Parser<'a> {
     input: &'a str,
     pos: usize,
+    depth: usize,
 }
 
 impl<'a> Parser<'a> {
@@ -86,7 +96,14 @@ impl<'a> Parser<'a> {
 
     fn parse_value(&mut self) -> Result<JsonValue> {
         self.skip_ws();
-        match self.peek_char() {
+        let container = matches!(self.peek_char(), Some('{' | '['));
+        if container {
+            self.depth += 1;
+            if self.depth > MAX_DEPTH {
+                return Err(Error::new("JSON nesting is too deep"));
+            }
+        }
+        let result = match self.peek_char() {
             Some('{') => self.parse_object(),
             Some('[') => self.parse_array(),
             Some('"') => self.parse_string().map(JsonValue::String),
@@ -96,7 +113,11 @@ impl<'a> Parser<'a> {
             Some('-') | Some('0'..='9') => self.parse_number(),
             Some(other) => Err(Error::new(format!("unexpected JSON token: {other}"))),
             None => Err(Error::new("unexpected end of JSON input")),
+        };
+        if container {
+            self.depth -= 1;
         }
+        result
     }
 
     fn parse_object(&mut self) -> Result<JsonValue> {
@@ -270,5 +291,18 @@ impl<'a> Parser<'a> {
             self.expect(ch)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deep_nesting_is_rejected_instead_of_overflowing_the_stack() {
+        let too_deep = format!("{}{}", "[".repeat(MAX_DEPTH + 1), "]".repeat(MAX_DEPTH + 1));
+        assert!(parse(&too_deep).is_err());
+        let acceptable = format!("{}{}", "[".repeat(MAX_DEPTH), "]".repeat(MAX_DEPTH));
+        assert!(parse(&acceptable).is_ok());
     }
 }

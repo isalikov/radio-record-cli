@@ -17,9 +17,14 @@ const TICK: Duration = Duration::from_millis(50);
 const IPC_STARTUP_GRACE: Duration = Duration::from_secs(20);
 // Rounds over a station's full stream list before giving up. Stream hosts sit behind
 // rotating DNS pools, so a later lookup can hand out an address the first one did not.
-const STREAM_ROUNDS: u32 = 3;
+pub const STREAM_ROUNDS: u32 = 3;
 const STREAM_RETRY_DELAY: Duration = Duration::from_secs(2);
-const METER: &str = "--af-add=@radiome_meter:lavfi=[astats=metadata=1:reset=1:measure_perchannel=none:measure_overall=RMS_level]";
+// A live engine reports every tick; a longer silence while audio should be alive
+// means the worker is gone, and the UI must say so instead of freezing.
+const WORKER_STALL_AFTER: Duration = Duration::from_secs(2);
+// Per-channel levels plus the Overall fallback: the stereo meter rides the same
+// single af-metadata reply, with no extra IPC traffic; mono degrades to a mirror.
+const METER: &str = "--af-add=@radiome_meter:lavfi=[astats=metadata=1:reset=1:measure_perchannel=RMS_level:measure_overall=RMS_level]";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PlayerState {
@@ -31,11 +36,23 @@ pub enum PlayerState {
     Error,
 }
 
+/// Everything the worker knows, published to the main thread once per tick.
+/// New fields must stay `Default` + `Clone` and reset on `play`, `stop`,
+/// and `start-file`, or the previous stream's data leaks into the next one.
 #[derive(Debug, Clone, Default)]
 pub struct Snapshot {
     pub state: PlayerState,
-    pub level: f64,
+    pub levels: [f64; 2],
+    pub peaks: [f64; 2],
     pub error: Option<String>,
+    pub codec: Option<String>,
+    pub samplerate: Option<u64>,
+    pub channels: Option<u64>,
+    pub bitrate: Option<u64>,
+    pub buffering: Option<u8>,
+    pub cache_seconds: Option<f64>,
+    pub stream: Option<String>,
+    pub stream_round: u32,
 }
 
 enum Request {
@@ -51,6 +68,7 @@ pub struct Player {
     rx: Receiver<(u64, Snapshot)>,
     media_rx: Receiver<isize>,
     generation: u64,
+    last_update: Instant,
     worker: Option<JoinHandle<()>>,
     pub snapshot: Snapshot,
 }
@@ -66,6 +84,7 @@ impl Player {
             rx,
             media_rx,
             generation: 0,
+            last_update: Instant::now(),
             worker: Some(worker),
             snapshot: Snapshot::default(),
         }
@@ -91,15 +110,34 @@ impl Player {
         let _ = self.tx.send(Request::Volume(volume.min(100)));
     }
     pub fn update(&mut self) {
+        let mut received = false;
         for (generation, update) in self.rx.try_iter() {
+            received = true;
             if generation == self.generation {
                 self.snapshot = update;
             }
+        }
+        if received {
+            self.last_update = Instant::now();
         }
     }
 
     pub fn media_commands(&self) -> Vec<isize> {
         self.media_rx.try_iter().collect()
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// The worker sends a snapshot every tick while an engine is alive. No message
+    /// for `WORKER_STALL_AFTER` during buffering, playback, or pause means it
+    /// panicked or hung; the main thread surfaces that instead of a frozen UI.
+    pub fn worker_stalled(&self) -> bool {
+        matches!(
+            self.snapshot.state,
+            PlayerState::Buffering | PlayerState::Playing | PlayerState::Paused
+        ) && self.last_update.elapsed() > WORKER_STALL_AFTER
     }
 }
 
@@ -140,7 +178,7 @@ fn worker(
                                 Snapshot {
                                     state: PlayerState::Error,
                                     error: Some(err.to_string()),
-                                    level: 0.0,
+                                    ..Snapshot::default()
                                 },
                             ));
                         }
@@ -155,6 +193,8 @@ fn worker(
                     engine.command(json!(["set_property", "pause", false]));
                     engine.streams = Streams::new(urls);
                     if let Some(url) = engine.streams.next() {
+                        engine.snapshot.stream = Some(url.clone());
+                        engine.snapshot.stream_round = engine.streams.round + 1;
                         engine.load(&url);
                     }
                 }
@@ -178,7 +218,7 @@ fn worker(
                     Snapshot {
                         state: PlayerState::Error,
                         error: Some(err.to_string()),
-                        level: 0.0,
+                        ..Snapshot::default()
                     },
                 ));
                 engine = None;
@@ -206,6 +246,8 @@ struct Engine {
     output: Vec<u8>,
     started: Instant,
     metered: Instant,
+    buffering_polled: Instant,
+    cache_polled: Instant,
     paused: bool,
     snapshot: Snapshot,
 }
@@ -271,6 +313,8 @@ impl Engine {
             output: Vec::new(),
             started: Instant::now(),
             metered: Instant::now(),
+            buffering_polled: Instant::now(),
+            cache_polled: Instant::now(),
             paused: false,
             snapshot: Snapshot::default(),
         })
@@ -298,7 +342,14 @@ impl Engine {
                 Ok(socket) => {
                     socket.set_nonblocking(true)?;
                     self.socket = Some(socket);
-                    for (id, property) in [(1, "pause"), (2, "core-idle")] {
+                    for (id, property) in [
+                        (1, "pause"),
+                        (2, "core-idle"),
+                        (3, "audio-codec-name"),
+                        (4, "audio-params/samplerate"),
+                        (5, "audio-params/channel-count"),
+                        (6, "audio-bitrate"),
+                    ] {
                         self.command(json!(["observe_property", id, property]));
                     }
                 }
@@ -312,14 +363,40 @@ impl Engine {
             }
         }
         if let Some(url) = self.streams.due(Instant::now()) {
+            self.snapshot.stream = Some(url.clone());
+            self.snapshot.stream_round = self.streams.round + 1;
             self.load(&url);
         }
         if self.metered.elapsed() >= TICK {
             self.request(json!(["get_property", "af-metadata/radiome_meter"]), 10);
             self.metered = Instant::now();
             if self.meter_received.elapsed() > Duration::from_millis(250) {
-                self.snapshot.level *= 0.8;
+                for level in &mut self.snapshot.levels {
+                    *level *= 0.8;
+                }
+                for peak in &mut self.snapshot.peaks {
+                    *peak *= 0.8;
+                }
             }
+        }
+        // Volatile properties are polled at a low rate and only while their state is
+        // active, so a healthy stream costs no extra requests at all.
+        if self.snapshot.state == PlayerState::Buffering
+            && self.buffering_polled.elapsed() >= Duration::from_millis(500)
+        {
+            self.request(json!(["get_property", "cache-buffering-state"]), 11);
+            self.buffering_polled = Instant::now();
+        }
+        if self.snapshot.state == PlayerState::Playing
+            && self.cache_polled.elapsed() >= Duration::from_millis(1000)
+        {
+            self.request(json!(["get_property", "demuxer-cache-duration"]), 12);
+            self.cache_polled = Instant::now();
+        }
+        // Mirror of the input cap: an mpv that stopped reading its socket must be
+        // reported, not allowed to grow the pending request queue without bound.
+        if self.output.len() > 1_048_576 {
+            return Err(Error::new("mpv IPC requests are backing up"));
         }
         let socket = self.socket.as_mut().unwrap();
         while !self.output.is_empty() {
@@ -351,8 +428,13 @@ impl Engine {
             }
         }
         if self.snapshot.state != PlayerState::Playing {
-            self.snapshot.level = 0.0;
+            self.snapshot.levels = [0.0; 2];
+            self.snapshot.peaks = [0.0; 2];
+            self.snapshot.cache_seconds = None;
             self.meter = AudioMeter::default();
+        }
+        if self.snapshot.state != PlayerState::Buffering {
+            self.snapshot.buffering = None;
         }
         Ok(())
     }
@@ -365,9 +447,17 @@ impl Engine {
             },
             Some("start-file") => {
                 self.meter = AudioMeter::default();
-                self.snapshot.level = 0.0;
+                self.snapshot.levels = [0.0; 2];
+                self.snapshot.peaks = [0.0; 2];
                 self.snapshot.state = PlayerState::Buffering;
                 self.snapshot.error = None;
+                // Telemetry belongs to the stream that is starting, never the one before it.
+                self.snapshot.codec = None;
+                self.snapshot.samplerate = None;
+                self.snapshot.channels = None;
+                self.snapshot.bitrate = None;
+                self.snapshot.buffering = None;
+                self.snapshot.cache_seconds = None;
             }
             Some("property-change") => match value["name"].as_str() {
                 Some("pause") => {
@@ -389,12 +479,26 @@ impl Engine {
                         PlayerState::Buffering
                     };
                 }
+                Some("audio-codec-name") => {
+                    self.snapshot.codec = value["data"].as_str().map(str::to_owned);
+                }
+                Some("audio-params/samplerate") => {
+                    self.snapshot.samplerate = positive(value["data"].as_i64());
+                }
+                Some("audio-params/channel-count") => {
+                    self.snapshot.channels = positive(value["data"].as_i64());
+                }
+                Some("audio-bitrate") => {
+                    self.snapshot.bitrate = positive(value["data"].as_i64());
+                }
                 _ => {}
             },
             Some("end-file") if value["reason"] == "error" => {
                 let error = value["file_error"].as_str().unwrap_or("mpv error");
                 match self.streams.fail(error, Instant::now()) {
                     Failure::Load(url) => {
+                        self.snapshot.stream = Some(url.clone());
+                        self.snapshot.stream_round = self.streams.round + 1;
                         self.load(&url);
                         self.snapshot.state = PlayerState::Buffering;
                     }
@@ -409,8 +513,20 @@ impl Engine {
             _ => {}
         }
         if value["request_id"] == 10 && value["error"] == "success" {
-            self.snapshot.level = self.meter.update(&value["data"]);
+            let (levels, peaks) = self.meter.update(&value["data"]);
+            self.snapshot.levels = levels;
+            self.snapshot.peaks = peaks;
             self.meter_received = Instant::now();
+        }
+        if value["request_id"] == 11 && value["error"] == "success" {
+            self.snapshot.buffering = value["data"]
+                .as_i64()
+                .map(|percent| percent.clamp(0, 100) as u8);
+        }
+        if value["request_id"] == 12 && value["error"] == "success" {
+            self.snapshot.cache_seconds = value["data"]
+                .as_f64()
+                .filter(|seconds| seconds.is_finite() && *seconds >= 0.0);
         }
     }
 }
@@ -491,17 +607,48 @@ fn host(url: &str) -> &str {
     rest.split(['/', ':', '?']).next().unwrap_or(rest)
 }
 
+fn positive(value: Option<i64>) -> Option<u64> {
+    value.filter(|value| *value > 0).map(|value| value as u64)
+}
+
 #[derive(Default)]
 struct AudioMeter {
+    channels: [ChannelMeter; 2],
+}
+
+#[derive(Default)]
+struct ChannelMeter {
     samples: VecDeque<f64>,
     level: f64,
+    peak: f64,
 }
 
 impl AudioMeter {
-    fn update(&mut self, metadata: &Value) -> f64 {
-        let db = metadata["lavfi.astats.Overall.RMS_level"]
-            .as_str()
-            .and_then(|s| s.parse::<f64>().ok());
+    /// Reads both channels from a single af-metadata reply. A mono source has no
+    /// second channel, so the right side mirrors the left instead of staying dead.
+    fn update(&mut self, metadata: &Value) -> ([f64; 2], [f64; 2]) {
+        let overall = rms(metadata, "Overall");
+        let left = self.channels[0].update(rms(metadata, "1").or(overall));
+        match rms(metadata, "2") {
+            Some(db) => {
+                let right = self.channels[1].update(Some(db));
+                self.channels[0].hold_peak();
+                self.channels[1].hold_peak();
+                (
+                    [left, right],
+                    [self.channels[0].peak, self.channels[1].peak],
+                )
+            }
+            None => {
+                self.channels[0].hold_peak();
+                ([left, left], [self.channels[0].peak, self.channels[0].peak])
+            }
+        }
+    }
+}
+
+impl ChannelMeter {
+    fn update(&mut self, db: Option<f64>) -> f64 {
         let Some(db) = db.filter(|db| db.is_finite() && *db > -60.0) else {
             self.level *= 0.65;
             if self.level < 0.005 {
@@ -527,6 +674,21 @@ impl AudioMeter {
         self.level += (target - self.level) * easing;
         self.level
     }
+    // The peak marker lingers after the beat: it never rises without real audio
+    // and falls back slowly, about one percent per update.
+    fn hold_peak(&mut self) {
+        self.peak *= 0.99;
+        if self.level > self.peak {
+            self.peak = self.level;
+        }
+    }
+}
+
+fn rms(metadata: &Value, channel: &str) -> Option<f64> {
+    let key = format!("lavfi.astats.{channel}.RMS_level");
+    metadata[key.as_str()]
+        .as_str()
+        .and_then(|value| value.parse::<f64>().ok())
 }
 
 impl Drop for Engine {
@@ -539,18 +701,52 @@ impl Drop for Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn late_audio_updates_cannot_restore_a_stopped_station() {
+
+    fn player_without_worker() -> (Player, Sender<(u64, Snapshot)>) {
         let (tx, _commands) = mpsc::channel();
         let (updates, rx) = mpsc::channel();
-        let mut player = Player {
-            tx,
-            rx,
-            media_rx: mpsc::channel().1,
-            generation: 0,
-            worker: None,
+        (
+            Player {
+                tx,
+                rx,
+                media_rx: mpsc::channel().1,
+                generation: 0,
+                last_update: Instant::now(),
+                worker: None,
+                snapshot: Snapshot::default(),
+            },
+            updates,
+        )
+    }
+
+    // message() only touches Engine fields, so a throwaway child process stands in
+    // for mpv; it is killed by the Drop guard like the real one.
+    fn engine_without_mpv() -> Engine {
+        Engine {
+            media: Vec::new(),
+            streams: Streams::default(),
+            meter: AudioMeter::default(),
+            meter_received: Instant::now(),
+            child: Command::new("true").spawn().unwrap(),
+            directory: tempfile::Builder::new()
+                .prefix("radiome-test-")
+                .tempdir_in("/tmp")
+                .unwrap(),
+            socket: None,
+            input: Vec::new(),
+            output: Vec::new(),
+            started: Instant::now(),
+            metered: Instant::now(),
+            buffering_polled: Instant::now(),
+            cache_polled: Instant::now(),
+            paused: false,
             snapshot: Snapshot::default(),
-        };
+        }
+    }
+
+    #[test]
+    fn late_audio_updates_cannot_restore_a_stopped_station() {
+        let (mut player, updates) = player_without_worker();
         player.play(vec!["https://example.com/first".into()]);
         updates
             .send((
@@ -577,6 +773,82 @@ mod tests {
         player.update();
         assert_eq!(player.snapshot.state, PlayerState::Buffering);
     }
+
+    #[test]
+    fn worker_stall_is_detected_only_while_audio_should_be_alive() {
+        let (mut player, updates) = player_without_worker();
+        player.snapshot.state = PlayerState::Playing;
+        player.last_update -= WORKER_STALL_AFTER + Duration::from_millis(50);
+        assert!(player.worker_stalled());
+        updates
+            .send((
+                0,
+                Snapshot {
+                    state: PlayerState::Playing,
+                    ..Snapshot::default()
+                },
+            ))
+            .unwrap();
+        player.update();
+        assert!(!player.worker_stalled(), "a heartbeat clears the stall");
+        player.snapshot.state = PlayerState::Idle;
+        player.last_update -= WORKER_STALL_AFTER;
+        assert!(!player.worker_stalled(), "an idle player owes no heartbeat");
+    }
+
+    #[test]
+    fn telemetry_parses_properties_and_resets_between_streams() {
+        let mut engine = engine_without_mpv();
+        engine.message(&json!({"event": "start-file"}));
+        assert_eq!(engine.snapshot.state, PlayerState::Buffering);
+        engine.message(
+            &json!({"event": "property-change", "name": "audio-codec-name", "data": "aac"}),
+        );
+        engine.message(
+            &json!({"event": "property-change", "name": "audio-params/samplerate", "data": 44100}),
+        );
+        engine.message(
+            &json!({"event": "property-change", "name": "audio-params/channel-count", "data": 2}),
+        );
+        engine
+            .message(&json!({"event": "property-change", "name": "audio-bitrate", "data": 128000}));
+        assert_eq!(engine.snapshot.codec.as_deref(), Some("aac"));
+        assert_eq!(engine.snapshot.samplerate, Some(44_100));
+        assert_eq!(engine.snapshot.channels, Some(2));
+        assert_eq!(engine.snapshot.bitrate, Some(128_000));
+        engine.message(&json!({"request_id": 11, "error": "success", "data": 42}));
+        assert_eq!(engine.snapshot.buffering, Some(42));
+        engine.message(&json!({"request_id": 11, "error": "success", "data": 250}));
+        assert_eq!(engine.snapshot.buffering, Some(100));
+        engine.message(&json!({"request_id": 12, "error": "success", "data": 1.5}));
+        assert_eq!(engine.snapshot.cache_seconds, Some(1.5));
+        // The next stream must not inherit the previous stream's telemetry.
+        engine.message(&json!({"event": "start-file"}));
+        assert_eq!(engine.snapshot.codec, None);
+        assert_eq!(engine.snapshot.samplerate, None);
+        assert_eq!(engine.snapshot.channels, None);
+        assert_eq!(engine.snapshot.bitrate, None);
+        assert_eq!(engine.snapshot.buffering, None);
+        assert_eq!(engine.snapshot.cache_seconds, None);
+    }
+
+    #[test]
+    fn stream_failures_update_the_active_stream_and_round() {
+        let mut engine = engine_without_mpv();
+        let first = "https://a.example.com/96.aacp".to_owned();
+        let second = "https://hls.example.com/playlist.m3u8".to_owned();
+        engine.streams = Streams::new(vec![first.clone(), second.clone()]);
+        engine.streams.next();
+        engine.snapshot.stream = Some(first);
+        engine.snapshot.stream_round = 1;
+        engine.message(
+            &json!({"event": "end-file", "reason": "error", "file_error": "loading failed"}),
+        );
+        assert_eq!(engine.snapshot.stream.as_deref(), Some(second.as_str()));
+        assert_eq!(engine.snapshot.stream_round, 1);
+        assert_eq!(engine.snapshot.state, PlayerState::Buffering);
+    }
+
     #[test]
     fn streams_fall_back_retry_and_name_unreachable_hosts() {
         let mut streams = Streams::new(vec![
@@ -619,28 +891,37 @@ mod tests {
             _ => panic!("must give up after the last round"),
         }
     }
+
     #[test]
     fn meter_rejects_missing_and_non_finite_levels() {
         let mut meter = AudioMeter::default();
         for value in ["-inf", "NaN", "inf", "broken"] {
-            assert_eq!(
-                meter.update(&json!({"lavfi.astats.Overall.RMS_level": value})),
-                0.0
-            );
+            let (levels, peaks) = meter.update(&json!({"lavfi.astats.Overall.RMS_level": value}));
+            assert_eq!(levels, [0.0, 0.0]);
+            assert_eq!(peaks, [0.0, 0.0]);
         }
-        assert_eq!(meter.update(&json!({})), 0.0);
+        let (levels, peaks) = meter.update(&json!({}));
+        assert_eq!(levels, [0.0, 0.0]);
+        assert_eq!(peaks, [0.0, 0.0]);
     }
 
     #[test]
     fn loud_radio_has_headroom_and_a_smooth_wide_range() {
         let mut meter = AudioMeter::default();
         for _ in 0..80 {
-            meter.update(&json!({"lavfi.astats.Overall.RMS_level": "-6"}));
+            meter.update(
+                &json!({"lavfi.astats.1.RMS_level": "-6", "lavfi.astats.2.RMS_level": "-6"}),
+            );
         }
-        assert!((meter.level - 0.5).abs() < 0.01);
+        assert!((meter.channels[0].level - 0.5).abs() < 0.01);
+        assert!((meter.channels[1].level - 0.5).abs() < 0.01);
         let mut values = Vec::new();
         for db in [-4, -4, -4, -8, -8, -8, -8, -8, -8] {
-            values.push(meter.update(&json!({"lavfi.astats.Overall.RMS_level": db.to_string()})));
+            let (levels, _) = meter.update(&json!({
+                "lavfi.astats.1.RMS_level": db.to_string(),
+                "lavfi.astats.2.RMS_level": db.to_string(),
+            }));
+            values.push(levels[0]);
         }
         assert!(values[2] > 0.8 && values[8] < 0.3, "{values:?}");
         assert!(
@@ -650,10 +931,49 @@ mod tests {
         );
         assert!(values.iter().all(|value| *value < 0.96));
         for _ in 0..30 {
-            meter.update(&json!({"lavfi.astats.Overall.RMS_level": "-inf"}));
+            meter.update(
+                &json!({"lavfi.astats.1.RMS_level": "-inf", "lavfi.astats.2.RMS_level": "-inf"}),
+            );
         }
-        assert_eq!(meter.level, 0.0);
+        assert_eq!(meter.channels[0].level, 0.0);
+        assert_eq!(meter.channels[1].level, 0.0);
     }
+
+    #[test]
+    fn peak_holds_above_the_level_and_falls_slowly() {
+        let mut meter = AudioMeter::default();
+        for _ in 0..80 {
+            meter.update(&json!({"lavfi.astats.1.RMS_level": "-6"}));
+        }
+        meter.update(&json!({"lavfi.astats.1.RMS_level": "-2"}));
+        let (levels, peaks) = meter.update(&json!({"lavfi.astats.1.RMS_level": "-70"}));
+        assert!(peaks[0] > levels[0], "the marker must outlive the dip");
+        for _ in 0..10 {
+            meter.update(&json!({"lavfi.astats.1.RMS_level": "-70"}));
+        }
+        let (levels, peaks) = meter.update(&json!({"lavfi.astats.1.RMS_level": "-70"}));
+        assert!(peaks[0] > 0.1, "the marker must fall slowly, not instantly");
+        assert!(peaks[0] > levels[0]);
+    }
+
+    #[test]
+    fn mono_sources_mirror_the_left_channel() {
+        let mut meter = AudioMeter::default();
+        for _ in 0..80 {
+            meter.update(&json!({
+                "lavfi.astats.Overall.RMS_level": "-6",
+                "lavfi.astats.1.RMS_level": "-6",
+            }));
+        }
+        let (levels, peaks) = meter.update(&json!({
+            "lavfi.astats.Overall.RMS_level": "-4",
+            "lavfi.astats.1.RMS_level": "-4",
+        }));
+        assert_eq!(levels[0], levels[1]);
+        assert_eq!(peaks[0], peaks[1]);
+        assert!(levels[0] > 0.5);
+    }
+
     #[test]
     #[ignore = "requires mpv and local Unix sockets; uses silent audio output"]
     fn mpv_falls_back_measures_real_audio_and_accepts_volume_and_pause() {
@@ -668,15 +988,19 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(8);
         while Instant::now() < deadline {
             engine.tick().unwrap();
-            if engine.snapshot.state == PlayerState::Playing && engine.snapshot.level > 0.1 {
+            if engine.snapshot.state == PlayerState::Playing && engine.snapshot.levels[0] > 0.1 {
                 break;
             }
             thread::sleep(TICK);
         }
         assert_eq!(engine.snapshot.state, PlayerState::Playing);
         assert!(
-            engine.snapshot.level > 0.1,
+            engine.snapshot.levels[0] > 0.1,
             "must measure the decoded sine wave"
+        );
+        assert_eq!(
+            engine.snapshot.levels[1], engine.snapshot.levels[0],
+            "a mono source must mirror the left channel"
         );
         engine.command(json!(["set_property", "volume", 20]));
         engine.command(json!(["keypress", "PLAY"]));
@@ -686,7 +1010,7 @@ mod tests {
             thread::sleep(TICK);
         }
         assert_eq!(engine.snapshot.state, PlayerState::Paused);
-        assert_eq!(engine.snapshot.level, 0.0);
+        assert_eq!(engine.snapshot.levels, [0.0; 2]);
         engine.command(json!(["keypress", "PLAYPAUSE"]));
         let deadline = Instant::now() + Duration::from_secs(2);
         while Instant::now() < deadline && engine.snapshot.state != PlayerState::Playing {

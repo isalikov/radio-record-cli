@@ -1,11 +1,16 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MediaKeyCode};
 use ratatui::widgets::ListState;
+use std::{collections::VecDeque, time::Duration};
 
 use crate::{
     api::{Catalog, Station, Track},
     player::{PlayerState, Snapshot},
     settings::Settings,
 };
+
+// Sparkline memory: one sample per redraw, bounded independently of the terminal
+// width so a resize never reallocates the history.
+const METER_HISTORY: usize = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Category {
@@ -53,6 +58,12 @@ pub struct App {
     pub help: bool,
     pub help_scroll: u16,
     pub show_history: bool,
+    pub show_diag: bool,
+    pub generation: u64,
+    pub uptime: Duration,
+    pub history_age: Option<Duration>,
+    pub worker_stalled: bool,
+    pub meter_history: VecDeque<f64>,
     pub now: Option<Station>,
     pub history: Vec<Track>,
     pub history_loading: bool,
@@ -74,6 +85,12 @@ impl App {
             help: false,
             help_scroll: 0,
             show_history: true,
+            show_diag: false,
+            generation: 0,
+            uptime: Duration::ZERO,
+            history_age: None,
+            worker_stalled: false,
+            meter_history: VecDeque::new(),
             now: None,
             history: Vec::new(),
             history_loading: false,
@@ -164,6 +181,20 @@ impl App {
         self.history_error = None;
     }
 
+    /// One level sample per redraw. The sparkline is a recording of worker data,
+    /// never a second source of truth, and never grows past `METER_HISTORY`.
+    pub fn push_meter_sample(&mut self) {
+        let level = if self.playback.state == PlayerState::Playing {
+            self.playback.levels[0].max(self.playback.levels[1])
+        } else {
+            0.0
+        };
+        self.meter_history.push_back(level);
+        while self.meter_history.len() > METER_HISTORY {
+            self.meter_history.pop_front();
+        }
+    }
+
     pub fn key(&mut self, key: KeyEvent) -> Action {
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             return Action::Quit;
@@ -218,12 +249,24 @@ impl App {
             }
             return Action::None;
         }
+        if self.show_diag {
+            if matches!(
+                key.code,
+                KeyCode::Esc | KeyCode::Char('d') | KeyCode::Char('?')
+            ) {
+                self.show_diag = false;
+            } else if key.code == KeyCode::Char('q') {
+                return Action::Quit;
+            }
+            return Action::None;
+        }
         match key.code {
             KeyCode::Char('q') => return Action::Quit,
             KeyCode::Char('?') => {
                 self.help = true;
                 self.help_scroll = 0;
             }
+            KeyCode::Char('d') => self.show_diag = true,
             KeyCode::Esc => self.error = None,
             KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => self.change_category(-1),
             KeyCode::Tab => self.change_category(1),
@@ -495,5 +538,38 @@ pub mod tests {
         assert_eq!(app.settings.volume, 0);
         press(&mut app, KeyCode::Char('/'));
         assert!(matches!(press(&mut app, KeyCode::Char('q')), Action::Quit));
+    }
+
+    #[test]
+    fn diag_overlay_opens_on_d_and_closes_on_esc() {
+        let mut app = fixture();
+        assert!(!app.show_diag);
+        press(&mut app, KeyCode::Char('d'));
+        assert!(app.show_diag);
+        assert!(matches!(press(&mut app, KeyCode::Char('q')), Action::Quit));
+        press(&mut app, KeyCode::Char('d'));
+        assert!(!app.show_diag, "'d' closes the overlay");
+        press(&mut app, KeyCode::Char('d'));
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.show_diag, "Esc closes the overlay");
+        // Transport keys keep working while the overlay is open.
+        press(&mut app, KeyCode::Enter);
+        app.playback.state = PlayerState::Playing;
+        app.show_diag = true;
+        assert!(matches!(press(&mut app, KeyCode::F(8)), Action::Pause));
+    }
+
+    #[test]
+    fn meter_history_is_bounded_and_records_only_playback() {
+        let mut app = fixture();
+        for _ in 0..1000 {
+            app.push_meter_sample();
+        }
+        assert_eq!(app.meter_history.len(), METER_HISTORY);
+        assert!(app.meter_history.iter().all(|level| *level == 0.0));
+        app.playback.state = PlayerState::Playing;
+        app.playback.levels = [0.7, 0.4];
+        app.push_meter_sample();
+        assert_eq!(*app.meter_history.back().unwrap(), 0.7);
     }
 }

@@ -4,6 +4,25 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+- Add a diagnostics overlay on `d`: player state and generation, codec, sample
+  rate, channels, bitrate, the active stream and its fallback round, cache fill,
+  worker health, history age, uptime, and a level sparkline.
+- Detect a stalled player worker: if an engine that should be alive stops
+  reporting for two seconds, the UI shows `Player engine stalled · q quit`
+  instead of freezing on a silent "buffering" state.
+- Show the real cache percentage next to the buffering dot while a stream fills.
+- Split the level line into left and right channel meters with a bold peak-hold
+  tick; mono sources mirror the left channel, and the meter still rides the same
+  single IPC reply per tick.
+- Reject JSON nested deeper than 128 levels in the API parser instead of
+  overflowing the stack, which would abort without restoring the terminal.
+- Cap the pending mpv IPC request queue at 1 MiB, mirroring the response cap, so
+  an mpv that stops reading its socket is reported instead of growing forever.
+- Add color themes selected with `RADIOME_THEME`: `amber` (monochrome amber CRT),
+  `phosphor` (green terminal), and `paper` (light), alongside `default`. Unknown
+  names fall back to `default` with a note on stderr.
+- Respect `NO_COLOR`, which was documented but not implemented: colors fall back
+  to terminal defaults, and `NO_COLOR` takes precedence over `RADIOME_THEME`.
 - Fall back to the station's next stream (`stream_320` → `stream_hls` →
   `stream_128` → `stream_64`) when one fails to load, instead of stopping with
   `Stream unavailable: loading failed`. Fixes playback when the direct stream

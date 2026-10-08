@@ -22,7 +22,8 @@
 
 Keyboard-only Rust radio player for [Radio Record](https://www.radiorecord.ru/).
 Categories on the left, stations on the right, recent tracks below.
-Cyan marks playback; magenta marks the selected category and favorites.
+The accent color marks playback; the alert color marks the selected category
+and favorites.
 
 ## Run
 
@@ -40,8 +41,12 @@ make run
 ```
 
 Plain `make` prints help. Minimum terminal size: 44 × 12. History is hidden in
-short windows to leave room for stations. Truecolor terminals show the full palette;
-`NO_COLOR` disables colors.
+short windows to leave room for stations. Truecolor terminals show the full palette.
+
+`RADIOME_THEME` selects a color theme: `default` (cyan and magenta on dark),
+`amber` (monochrome amber CRT), `phosphor` (green terminal), or `paper`
+(light, for white terminals). An unknown name falls back to `default` with a
+note on stderr. `NO_COLOR` disables colors and takes precedence over the theme.
 
 ## Install
 
@@ -126,6 +131,7 @@ Bug reports, station suggestions, and small improvements are welcome too.
 | - / = | Player volume, 5% steps, 0–100% |
 | f | Toggle favorite |
 | i | Show / hide recent tracks |
+| d | Toggle diagnostics overlay |
 | PgUp / PgDn, Home / End | Scroll stations |
 | r | Refresh stations and history |
 | s | Stop |
@@ -150,11 +156,22 @@ function keys to the terminal. No global keyboard interception is installed.
 
 ## Audio and settings
 
-The thin line follows the current decoded audio level at 20 Hz. Its scale adapts
-to the last four seconds of the station's loudness, leaving headroom for beats.
-Attack and release are smoothed; there is no scrolling or synthetic animation.
-Silence, pause and buffering settle the line. Physical stroke thickness is
-determined by the terminal font, not an exact pixel size.
+Two thin lines follow the decoded left and right audio levels at 20 Hz, with a
+bold tick marking the slowly falling peak hold. Their scale adapts to the last
+four seconds of the station's loudness, leaving headroom for beats. Attack and
+release are smoothed; there is no scrolling or synthetic animation. Silence,
+pause and buffering settle both lines, and mono sources mirror the left channel.
+Physical stroke thickness is determined by the terminal font, not an exact pixel
+size.
+
+Press `d` for a diagnostics overlay: player state and generation, codec, sample
+rate, channels, bitrate, the active stream and its fallback round, cache fill,
+worker health, history age, uptime, and a sparkline of recent levels. Telemetry
+arrives over the existing mpv IPC on the worker thread; volatile properties are
+polled at a low rate and only while they are meaningful. While a stream buffers,
+the status symbol shows the real cache percentage instead of a bare dot. If the
+player worker stops reporting for two seconds while audio should be alive, the
+footer shows `Player engine stalled · q quit`.
 
 The UI and application logic use Rust, Ratatui and Crossterm. Audio uses an
 external mpv process with private IPC; curl fetches API data on worker threads.
