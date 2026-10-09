@@ -532,6 +532,18 @@ fn device_rate(min: u32, max: u32, rate: u32) -> Option<u32> {
     }
 }
 
+/// CPAL also reports nonfatal notifications through its error callback.
+/// Keep this path allocation-free: overload notifications can run on the
+/// real-time audio thread. A fatal failure stays latched until the sink drops.
+fn handle_output_error(kind: cpal::ErrorKind, failed: &AtomicBool) {
+    if !matches!(
+        kind,
+        cpal::ErrorKind::DeviceChanged | cpal::ErrorKind::Xrun | cpal::ErrorKind::RealtimeDenied
+    ) {
+        failed.store(true, Ordering::Relaxed);
+    }
+}
+
 /// The production sink: a cpal output stream whose callback drains the ring.
 pub(crate) fn cpal_sink(
     consumer: Consumer<f32>,
@@ -553,11 +565,7 @@ pub(crate) fn cpal_sink(
         let error_callback = {
             let failed = failed.clone();
             move |error: cpal::Error| {
-                // A default-device switch is handled inside cpal 0.18; only
-                // the device going away entirely is fatal for us.
-                if !matches!(error.kind(), cpal::ErrorKind::DeviceChanged) {
-                    failed.store(true, Ordering::Relaxed);
-                }
+                handle_output_error(error.kind(), &failed);
             }
         };
         let mut callback = callback;
@@ -1467,6 +1475,61 @@ pub(crate) mod tests {
     impl SinkHandle for TestSink {
         fn failed(&self) -> bool {
             false
+        }
+    }
+
+    struct ErrorSink(Arc<AtomicBool>);
+    impl SinkHandle for ErrorSink {
+        fn failed(&self) -> bool {
+            self.0.load(Ordering::Relaxed)
+        }
+    }
+
+    #[test]
+    fn output_notifications_keep_native_playback_alive() {
+        let mut engine = engine();
+        let failed = Arc::new(AtomicBool::new(false));
+        engine.sink = Some(Box::new(ErrorSink(failed.clone())));
+        engine.output.buffering.store(false, Ordering::Release);
+        let generation = engine.generation.load(Ordering::Relaxed);
+        for kind in [
+            cpal::ErrorKind::Xrun,
+            cpal::ErrorKind::DeviceChanged,
+            cpal::ErrorKind::RealtimeDenied,
+            cpal::ErrorKind::Xrun,
+        ] {
+            handle_output_error(kind, &failed);
+            engine.tick().unwrap();
+            assert_eq!(engine.snapshot.state, PlayerState::Playing);
+            assert!(engine.snapshot.error.is_none());
+            assert!(engine.sink.is_some());
+            assert_eq!(engine.generation.load(Ordering::Relaxed), generation);
+        }
+    }
+
+    #[test]
+    fn fatal_output_errors_remain_latched_and_stop_native_playback() {
+        for kind in [
+            cpal::ErrorKind::DeviceNotAvailable,
+            cpal::ErrorKind::StreamInvalidated,
+            cpal::ErrorKind::BackendError,
+            cpal::ErrorKind::Other,
+        ] {
+            let mut engine = engine();
+            let failed = Arc::new(AtomicBool::new(false));
+            engine.sink = Some(Box::new(ErrorSink(failed.clone())));
+            let generation = engine.generation.load(Ordering::Relaxed);
+            handle_output_error(kind, &failed);
+            // A later recoverable notification must not hide a fatal error.
+            handle_output_error(cpal::ErrorKind::Xrun, &failed);
+            engine.tick().unwrap();
+            assert_eq!(engine.snapshot.state, PlayerState::Error);
+            assert_eq!(
+                engine.snapshot.error.as_deref(),
+                Some("audio device failed · Enter to retry")
+            );
+            assert!(engine.sink.is_none());
+            assert_eq!(engine.generation.load(Ordering::Relaxed), generation + 1);
         }
     }
 

@@ -79,6 +79,13 @@ hint for installing mpv, which covers HE-AAC streams and native-engine failures.
 
 ### Troubleshooting
 
+**`audio device failed · Enter to retry`** — the native output stream reported
+a fatal error. Press Enter to reopen it. Brief device underruns/overruns,
+automatic audio-route changes, and denied real-time scheduling do not stop
+playback or trigger mpv fallback; a brief audio glitch may still be audible.
+In `auto` mode, a fatal error also tries mpv once. If mpv is absent, the
+message includes `mpv fallback unavailable`.
+
 **`Could not start mpv: No such file or directory`** — mpv is not installed.
 mpv is needed for HE-AAC streams (the 128k and 64k fallbacks), when forced
 with `RADIOME_ENGINE=mpv`, or after a native-engine failure in `auto` mode.

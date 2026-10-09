@@ -2,6 +2,14 @@
 
 All notable changes to this project are documented here.
 
+## [Unreleased]
+
+### Fixed
+
+- Keep native playback running after device underrun/overrun notifications or
+  denied real-time scheduling instead of reporting a fatal audio-device error
+  and attempting mpv fallback. Fatal output errors still stop playback.
+
 ## [v2.0.0] - 2026-10-09
 
 ### Added
