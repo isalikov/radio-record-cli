@@ -3,7 +3,7 @@ use ratatui::widgets::ListState;
 use std::{collections::VecDeque, time::Duration};
 
 use crate::{
-    api::{Catalog, Station, Track},
+    api::{Catalog, Station, Stream, Track},
     player::{PlayerState, Snapshot},
     settings::Settings,
 };
@@ -41,7 +41,7 @@ impl Category {
 pub enum Action {
     None,
     Quit,
-    Play(Vec<String>),
+    Play(Vec<Stream>),
     Pause,
     Stop,
     Volume(u8),
@@ -217,14 +217,22 @@ impl App {
         }
         match key.code {
             KeyCode::Media(MediaKeyCode::Play) => {
-                return if self.playback.state == PlayerState::Playing {
+                return if key.kind != KeyEventKind::Press
+                    || matches!(
+                        self.playback.state,
+                        PlayerState::Playing | PlayerState::Buffering
+                    ) {
                     Action::None
                 } else {
                     self.play_pause()
                 };
             }
             KeyCode::Media(MediaKeyCode::Pause) => {
-                return if self.playback.state == PlayerState::Playing {
+                return if key.kind == KeyEventKind::Press
+                    && matches!(
+                        self.playback.state,
+                        PlayerState::Playing | PlayerState::Buffering
+                    ) {
                     Action::Pause
                 } else {
                     Action::None
@@ -358,12 +366,8 @@ impl App {
         let Some(station) = self.selected_station().cloned() else {
             return Action::None;
         };
-        let urls: Vec<String> = station
-            .stream_urls()
-            .into_iter()
-            .map(str::to_owned)
-            .collect();
-        if urls.is_empty() {
+        let streams = station.streams();
+        if streams.is_empty() {
             self.error = Some("No stream available".into());
             return Action::None;
         }
@@ -376,7 +380,7 @@ impl App {
             state: PlayerState::Buffering,
             ..Snapshot::default()
         };
-        Action::Play(urls)
+        Action::Play(streams)
     }
 
     fn change_category(&mut self, direction: isize) {
@@ -497,6 +501,31 @@ pub mod tests {
         let mut repeat = KeyEvent::new(KeyCode::F(9), KeyModifiers::NONE);
         repeat.kind = KeyEventKind::Repeat;
         assert!(matches!(app.key(repeat), Action::None));
+    }
+
+    #[test]
+    fn separate_media_play_and_pause_are_idempotent_including_buffering() {
+        let mut app = fixture();
+        let play = KeyCode::Media(MediaKeyCode::Play);
+        let pause = KeyCode::Media(MediaKeyCode::Pause);
+        assert!(matches!(press(&mut app, play), Action::Play(_)));
+        assert_eq!(app.playback.state, PlayerState::Buffering);
+        assert!(matches!(press(&mut app, play), Action::None));
+        assert!(matches!(press(&mut app, pause), Action::Pause));
+        app.playback.state = PlayerState::Paused;
+        assert!(matches!(press(&mut app, pause), Action::None));
+        assert!(matches!(press(&mut app, play), Action::Pause));
+        app.playback.state = PlayerState::Playing;
+        app.help = true;
+        assert!(matches!(press(&mut app, play), Action::None));
+        assert!(matches!(press(&mut app, pause), Action::Pause));
+        for code in [play, pause] {
+            let mut repeat = KeyEvent::new(code, KeyModifiers::NONE);
+            repeat.kind = KeyEventKind::Repeat;
+            assert!(matches!(app.key(repeat), Action::None));
+            repeat.kind = KeyEventKind::Release;
+            assert!(matches!(app.key(repeat), Action::None));
+        }
     }
 
     #[test]

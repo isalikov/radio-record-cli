@@ -60,6 +60,9 @@ if curl -fsSL "$asset_url" -o "$tmp_dir/$asset"; then
 else
 	if have cargo; then
 		printf '%s\n' "Release asset not found, building from source with cargo"
+		if [ "$platform" = linux ]; then
+			printf '%s\n' "Linux source builds need ALSA headers and pkg-config (Debian/Ubuntu: sudo apt install libasound2-dev pkg-config)"
+		fi
 		cargo install --locked --git "https://github.com/$repo.git" --force --root "$prefix" radiome
 		printf '%s\n' "Installed to $bin_dir/radiome"
 	else
@@ -75,7 +78,8 @@ case ":$PATH:" in
 		;;
 esac
 
-# radiome spawns mpv for audio and curl for API requests at runtime.
+# radiome plays audio by itself; mpv is an optional fallback engine for the
+# HE-AAC (low-bitrate) streams of a station.
 case "$platform" in
 	macos)
 		mpv_hint="brew install mpv"
@@ -85,17 +89,14 @@ case "$platform" in
 		;;
 esac
 
-if ! have mpv; then
-	printf '\n%s\n%s\n' \
-		"mpv is not installed. radiome cannot play audio without it:" \
-		"  $mpv_hint"
-else
+if have mpv; then
 	# Warm up mpv once. On macOS the first launch of a freshly installed mpv can
 	# take many seconds while the system verifies its libraries; doing it here
-	# keeps the first station from timing out inside radiome.
+	# keeps the first fallback-engine start from timing out inside radiome.
 	mpv --version >/dev/null 2>&1 || true
-fi
-
-if ! have curl; then
-	printf '\n%s\n' "curl is not installed. radiome needs it to load the station list."
+else
+	printf '\n%s\n%s\n%s\n' \
+		"Note: mpv is not installed. radiome plays audio by itself." \
+		"mpv is an optional fallback for a station's HE-AAC streams:" \
+		"  $mpv_hint"
 fi

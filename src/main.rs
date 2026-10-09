@@ -1,14 +1,16 @@
 mod api;
 mod app;
+mod engine;
 mod error;
 mod json;
+mod media;
 mod player;
 mod settings;
 mod ui;
 
 use api::{Catalog, Client, Track};
 use app::{Action, App};
-use crossterm::event::{self, Event, KeyEventKind};
+use crossterm::event::{self, Event, KeyEvent, KeyEventKind, KeyModifiers};
 use error::{Error, Result};
 use player::Player;
 use settings::Settings;
@@ -133,6 +135,7 @@ fn run() -> Result<()> {
     let settings = Settings::load(&settings_path)?;
     let mut player = Player::new(settings.volume);
     let mut app = App::new(settings);
+    let mut media = media::MediaControls::new()?;
     let mut network = Network::new();
     network.catalog(&mut app);
     let theme = ui::theme_from_env();
@@ -162,6 +165,11 @@ fn run() -> Result<()> {
                 network.history(&mut app);
             }
         }
+        media.update(&app);
+        for key in media.poll() {
+            let action = app.key(KeyEvent::new(key, KeyModifiers::NONE));
+            dispatch(action, &mut app, &mut player, &mut network);
+        }
         if last_frame.elapsed() >= Duration::from_millis(50) {
             app.push_meter_sample();
             terminal.draw(|frame| ui::render(frame, &mut app, &theme))?;
@@ -177,24 +185,13 @@ fn run() -> Result<()> {
         }
         if event::poll(Duration::from_millis(10))? {
             match event::read()? {
-                Event::Key(key) if key.kind != KeyEventKind::Release => match app.key(key) {
-                    Action::Quit => break,
-                    Action::Play(urls) => {
-                        player.play(urls);
-                        network.history(&mut app);
+                Event::Key(key) if key.kind != KeyEventKind::Release => {
+                    let action = app.key(key);
+                    if matches!(action, Action::Quit) {
+                        break;
                     }
-                    Action::Pause => player.toggle_pause(),
-                    Action::Stop => {
-                        player.stop();
-                        network.history = None;
-                    }
-                    Action::Volume(value) => player.set_volume(value),
-                    Action::Refresh => {
-                        network.catalog(&mut app);
-                        network.history(&mut app);
-                    }
-                    Action::None => {}
-                },
+                    dispatch(action, &mut app, &mut player, &mut network);
+                }
                 Event::Resize(_, _) => {
                     terminal.draw(|frame| ui::render(frame, &mut app, &theme))?;
                 }
@@ -206,4 +203,24 @@ fn run() -> Result<()> {
         app.settings.save(&settings_path)?;
     }
     Ok(())
+}
+
+fn dispatch(action: Action, app: &mut App, player: &mut Player, network: &mut Network) {
+    match action {
+        Action::Play(urls) => {
+            player.play(urls);
+            network.history(app);
+        }
+        Action::Pause => player.toggle_pause(),
+        Action::Stop => {
+            player.stop();
+            network.history = None;
+        }
+        Action::Volume(value) => player.set_volume(value),
+        Action::Refresh => {
+            network.catalog(app);
+            network.history(app);
+        }
+        Action::None | Action::Quit => {}
+    }
 }

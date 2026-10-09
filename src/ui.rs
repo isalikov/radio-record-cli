@@ -137,7 +137,7 @@ pub fn render(frame: &mut Frame, app: &mut App, theme: &Theme) {
         );
         return;
     }
-    let [body, footer] = Layout::vertical([Constraint::Min(1), Constraint::Length(5)])
+    let [body, footer] = Layout::vertical([Constraint::Min(1), Constraint::Length(4)])
         .areas(area.inner(Margin::new(2, 1)));
     let category_width = if area.width >= 90 { 25 } else { 18 };
     let [sidebar, right] =
@@ -324,19 +324,18 @@ fn history(frame: &mut Frame, app: &mut App, area: Rect, theme: &Theme) {
 
 fn playback(frame: &mut Frame, app: &App, mut area: Rect, theme: &Theme) {
     let playing = app.playback.state == PlayerState::Playing;
-    let [levels, peaks] = if playing {
-        [app.playback.levels, app.playback.peaks]
+    // One bar, riding the louder channel; mono sources mirror the left one.
+    let level = if playing {
+        app.playback.levels[0].max(app.playback.levels[1])
     } else {
-        [[0.0; 2], [0.0; 2]]
+        0.0
     };
-    for (level, peak) in levels.into_iter().zip(peaks) {
-        frame.render_widget(
-            Paragraph::new(meter(area.width, level, peak, theme)),
-            Rect::new(area.x, area.y, area.width, 1),
-        );
-        area.y += 1;
-    }
-    let area = Rect::new(area.x, area.y, area.width, area.height - 2);
+    frame.render_widget(
+        Paragraph::new(meter(area.width, level, theme)),
+        Rect::new(area.x, area.y, area.width, 1),
+    );
+    area.y += 1;
+    let area = Rect::new(area.x, area.y, area.width, area.height - 1);
     let [status, volume] = Layout::horizontal([Constraint::Min(1), Constraint::Length(5)])
         .areas(Rect::new(area.x, area.y, area.width, 1));
     let symbol = match app.playback.state {
@@ -495,42 +494,27 @@ fn sparkline(history: &VecDeque<f64>, width: usize) -> String {
         .collect()
 }
 
-// One thin stroke per channel; its endpoint follows the current audio level, and a
-// bold tick marks the slowly falling peak hold. No history or scrolling here.
-// The terminal's font determines the physical stroke thickness.
-fn meter(width: u16, level: f64, peak: f64, theme: &Theme) -> Line<'static> {
+// One thin stroke following the current audio level. The percentile
+// normalization and attack/release easing upstream make the motion smooth;
+// there is no history, scrolling, or peak marker here. The terminal's font
+// determines the physical stroke thickness.
+fn meter(width: u16, level: f64, theme: &Theme) -> Line<'static> {
     let level = if level.is_finite() {
         level.clamp(0.0, 1.0)
     } else {
         0.0
     };
-    let peak = if peak.is_finite() {
-        peak.clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
     let active = (level * f64::from(width)).round() as usize;
-    let marker = (peak * f64::from(width)).round() as usize;
-    let marker = if marker > 0 {
-        Some((marker - 1).min(usize::from(width).saturating_sub(1)))
-    } else {
-        None
-    };
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut run = String::new();
     let mut run_style = Style::default();
     for index in 0..usize::from(width) {
-        let is_marker = marker == Some(index);
-        let style = if is_marker {
-            Style::default()
-                .fg(theme.accent)
-                .add_modifier(Modifier::BOLD)
-        } else if index < active {
+        let style = if index < active {
             Style::default().fg(theme.accent)
         } else {
             Style::default().fg(theme.edge)
         };
-        let symbol = if is_marker { "▔" } else { "─" };
+        let symbol = "─";
         if run_style == style && !run.is_empty() {
             run.push_str(symbol);
         } else {
@@ -654,9 +638,13 @@ fn diag(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         ),
         (
             "Buffer",
-            match app.playback.cache_seconds {
-                Some(seconds) => format!("{seconds:.1}s"),
-                None => "—".into(),
+            match (app.playback.cache_seconds, app.playback.underruns) {
+                (Some(seconds), 0) => format!("{seconds:.1}s"),
+                (Some(seconds), underruns) => {
+                    format!("{seconds:.1}s · {underruns} underruns")
+                }
+                (None, underruns) if underruns > 0 => format!("{underruns} underruns"),
+                _ => "—".into(),
             },
         ),
         (
@@ -765,13 +753,13 @@ mod tests {
     }
 
     #[test]
-    fn meter_strokes_follow_the_level_and_mark_the_peak() {
+    fn meter_strokes_follow_the_level() {
         let theme = Theme::default();
         for (level, expected) in [(0.0, 0), (0.25, 10), (0.75, 30), (1.0, 40), (f64::NAN, 0)] {
             let mut terminal = Terminal::new(TestBackend::new(40, 1)).unwrap();
             terminal
                 .draw(|frame| {
-                    frame.render_widget(Paragraph::new(meter(40, level, 0.0, &theme)), frame.area())
+                    frame.render_widget(Paragraph::new(meter(40, level, &theme)), frame.area())
                 })
                 .unwrap();
             let cells = terminal.backend().buffer().content();
@@ -781,43 +769,24 @@ mod tests {
                 expected
             );
         }
-        // The peak-hold tick sits past the live level, in bold.
-        let mut terminal = Terminal::new(TestBackend::new(40, 1)).unwrap();
-        terminal
-            .draw(|frame| {
-                frame.render_widget(Paragraph::new(meter(40, 0.25, 0.75, &theme)), frame.area())
-            })
-            .unwrap();
-        let cells = terminal.backend().buffer().content();
-        let marker = &cells[29];
-        assert_eq!(marker.symbol(), "▔");
-        assert_eq!(marker.fg, theme.accent);
-        assert!(marker.modifier.contains(Modifier::BOLD));
-        assert_eq!(
-            cells.iter().filter(|cell| cell.fg == theme.accent).count(),
-            11
-        );
     }
 
     #[test]
-    fn both_meter_lines_settle_when_not_playing() {
+    fn the_meter_settles_when_not_playing() {
         let theme = Theme::default();
         let mut app = fixture();
         app.now = app.selected_station().cloned();
         app.playback.state = PlayerState::Paused;
         app.playback.levels = [0.8, 0.6];
-        app.playback.peaks = [0.9, 0.9];
-        let mut terminal = Terminal::new(TestBackend::new(60, 5)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(60, 4)).unwrap();
         terminal
             .draw(|frame| playback(frame, &app, frame.area(), &theme))
             .unwrap();
         let buffer = terminal.backend().buffer();
-        for row in 0..2u16 {
-            for column in 0..60u16 {
-                let cell = &buffer[(column, row)];
-                if cell.symbol() == "─" {
-                    assert_eq!(cell.fg, theme.edge, "row {row} must be inactive");
-                }
+        for column in 0..60u16 {
+            let cell = &buffer[(column, 0)];
+            if cell.symbol() == "─" {
+                assert_eq!(cell.fg, theme.edge, "the bar must be at rest");
             }
         }
     }

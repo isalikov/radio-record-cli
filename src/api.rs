@@ -1,14 +1,19 @@
-use std::process::Command;
+use std::io::Read;
+use std::time::Duration;
 
 use crate::error::{Error, Result};
 use crate::json::{self, JsonValue};
 
 const BASE_URL: &str = "https://www.radiorecord.ru/api";
-const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36";
+pub(crate) const USER_AGENT: &str =
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36";
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Client {
     base_url: String,
+    http: ureq::Agent,
 }
 
 impl Client {
@@ -18,8 +23,15 @@ impl Client {
     }
 
     pub fn with_base_url(base_url: impl Into<String>) -> Self {
+        let http: ureq::Agent = ureq::Agent::config_builder()
+            .user_agent(USER_AGENT)
+            .timeout_connect(Some(CONNECT_TIMEOUT))
+            .timeout_global(Some(REQUEST_TIMEOUT))
+            .build()
+            .into();
         Self {
             base_url: base_url.into(),
+            http,
         }
     }
 
@@ -39,31 +51,17 @@ impl Client {
 
     fn fetch_json(&self, path: &str) -> Result<JsonValue> {
         let url = format!("{}{}", self.base_url, path);
-        let output = Command::new("curl")
-            .args([
-                "-fsSL",
-                "--compressed",
-                "--connect-timeout",
-                "5",
-                "--max-time",
-                "15",
-                "-A",
-                USER_AGENT,
-                &url,
-            ])
-            .output()
-            .map_err(|err| Error::new(format!("failed to run curl: {err}")))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(Error::new(format!(
-                "curl failed for {url}: {}",
-                stderr.trim()
-            )));
-        }
-
-        let body = String::from_utf8(output.stdout)
-            .map_err(|err| Error::new(format!("invalid UTF-8 from curl: {err}")))?;
+        let response = self
+            .http
+            .get(&url)
+            .call()
+            .map_err(|err| Error::new(format!("request failed for {url}: {err}")))?;
+        let mut body = String::new();
+        response
+            .into_body()
+            .as_reader()
+            .read_to_string(&mut body)
+            .map_err(|err| Error::new(format!("failed to read response from {url}: {err}")))?;
         json::parse(&body)
     }
 }
@@ -73,6 +71,26 @@ pub struct Catalog {
     pub stations: Vec<Station>,
     pub genres: Vec<Genre>,
     pub tags: Vec<Genre>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamKind {
+    /// `stream_320`: direct ADTS AAC-LC, ~96 kbps (the field name is historic).
+    Main,
+    /// `stream_hls`: HLS playlist; the AAC-LC variant is picked when played natively.
+    Hls,
+    /// `stream_128`: direct HE-AAC (SBR).
+    High,
+    /// `stream_64`: direct HE-AACv2 (SBR + parametric stereo).
+    Low,
+}
+
+/// One playable stream with the API field it came from, so each engine can
+/// filter the fallback list by what it can actually decode.
+#[derive(Debug, Clone)]
+pub struct Stream {
+    pub kind: StreamKind,
+    pub url: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,24 +109,37 @@ pub struct Station {
 
 impl Station {
     pub fn stream_url(&self) -> Option<&str> {
-        self.stream_urls().into_iter().next()
+        [
+            &self.stream_320,
+            &self.stream_hls,
+            &self.stream_128,
+            &self.stream_64,
+        ]
+        .into_iter()
+        .find(|url| !url.is_empty())
+        .map(|url| url.as_str())
     }
 
-    // Every distinct stream in priority order; the player falls back down the list when
-    // a host is unreachable (stream_320/128/64 share one host, HLS lives on another).
-    pub fn stream_urls(&self) -> Vec<&str> {
-        let mut urls = Vec::new();
-        for candidate in [
-            self.stream_320.as_str(),
-            self.stream_hls.as_str(),
-            self.stream_128.as_str(),
-            self.stream_64.as_str(),
+    // Every stream in priority order; the player falls back down the list when
+    // a host is unreachable (stream_320/128/64 share one host, HLS lives on
+    // another). Duplicate URLs are skipped: retrying the same one is pointless.
+    pub fn streams(&self) -> Vec<Stream> {
+        let mut collected: Vec<Stream> = Vec::new();
+        for (kind, url) in [
+            (StreamKind::Main, &self.stream_320),
+            (StreamKind::Hls, &self.stream_hls),
+            (StreamKind::High, &self.stream_128),
+            (StreamKind::Low, &self.stream_64),
         ] {
-            if !candidate.is_empty() && !urls.contains(&candidate) {
-                urls.push(candidate);
+            if url.is_empty() || collected.iter().any(|stream| stream.url == *url) {
+                continue;
             }
+            collected.push(Stream {
+                kind,
+                url: url.clone(),
+            });
         }
-        urls
+        collected
     }
 }
 
@@ -287,14 +318,22 @@ mod tests {
         station.stream_hls = "https://example.com/playlist.m3u8".into();
         station.stream_128 = station.stream_320.clone();
         station.stream_64 = "https://example.com/stream64.aacp".into();
+        let streams = station.streams();
         assert_eq!(
-            station.stream_urls(),
+            streams
+                .iter()
+                .map(|stream| stream.url.as_str())
+                .collect::<Vec<_>>(),
             [
                 "https://example.com/stream.mp3",
                 "https://example.com/playlist.m3u8",
                 "https://example.com/stream64.aacp",
             ]
         );
+        assert_eq!(streams[0].kind, StreamKind::Main);
+        assert_eq!(streams[1].kind, StreamKind::Hls);
+        // The duplicate 128k URL was skipped, so the low stream follows HLS.
+        assert_eq!(streams[2].kind, StreamKind::Low);
     }
 
     #[test]

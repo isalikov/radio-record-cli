@@ -9,6 +9,29 @@ ratatui = { version = "0.30", default-features = false, features = ["crossterm"]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"
+# HTTP for the API and HLS playlists. Default features are rustls (ring),
+# gzip, and webpki-roots: no system TLS stack or CA store is needed.
+ureq = "3"
+# Resolve relative HLS URLs, including root paths and query strings.
+url = "2"
+# HTTP for the live audio stream. ureq 3 has no per-read idle timeout on the
+# response body, which an endless ADTS stream needs to detect a stalled server;
+# ureq 2 does (`timeout_read`). Two clients is the price of staying synchronous.
+stream_http = { package = "ureq", version = "2", default-features = false, features = ["tls", "gzip", "webpki-roots"] }
+# Native engine: AAC-LC decoder with the built-in ADTS reader (MPL-2.0).
+symphonia = { version = "0.6", default-features = false, features = ["aac"] }
+# Audio output: CoreAudio on macOS, ALSA on Linux (needs libasound.so.2 at
+# runtime; no static ALSA link exists upstream, alsa-sys issue #10).
+cpal = "0.18"
+# Wait-free SPSC ring between the decode thread and the audio callback.
+rtrb = "0.4"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6"
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSResponder", "NSRunningApplication"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSDate", "NSDictionary", "NSObject", "NSString", "NSValue", "NSRunLoop", "NSObjCRuntime"] }
+objc2-media-player = { version = "0.3", default-features = false, features = ["std", "block2", "MPRemoteCommand", "MPRemoteCommandCenter", "MPRemoteCommandEvent", "MPNowPlayingInfoCenter", "MPMediaItem"] }
 
 [profile.dev]
 debug = true
