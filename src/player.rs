@@ -56,7 +56,6 @@ pub(crate) enum Request {
 pub struct Player {
     tx: Sender<Request>,
     rx: Receiver<(u64, Snapshot)>,
-    media_rx: Receiver<isize>,
     generation: u64,
     last_update: Instant,
     worker: Option<JoinHandle<()>>,
@@ -67,12 +66,10 @@ impl Player {
     pub fn new(volume: u8) -> Self {
         let (tx, commands) = mpsc::channel();
         let (updates, rx) = mpsc::channel();
-        let (media_tx, media_rx) = mpsc::channel();
-        let worker = thread::spawn(move || worker(commands, updates, media_tx, volume));
+        let worker = thread::spawn(move || worker(commands, updates, volume));
         Self {
             tx,
             rx,
-            media_rx,
             generation: 0,
             last_update: Instant::now(),
             worker: Some(worker),
@@ -113,10 +110,6 @@ impl Player {
         }
     }
 
-    pub fn media_commands(&self) -> Vec<isize> {
-        self.media_rx.try_iter().collect()
-    }
-
     pub fn generation(&self) -> u64 {
         self.generation
     }
@@ -141,19 +134,13 @@ impl Drop for Player {
     }
 }
 
-fn worker(
-    commands: Receiver<Request>,
-    updates: Sender<(u64, Snapshot)>,
-    media_tx: Sender<isize>,
-    volume: u8,
-) {
-    worker_with(commands, updates, media_tx, volume, crate::engine::open);
+fn worker(commands: Receiver<Request>, updates: Sender<(u64, Snapshot)>, volume: u8) {
+    worker_with(commands, updates, volume, crate::engine::open);
 }
 
 fn worker_with(
     commands: Receiver<Request>,
     updates: Sender<(u64, Snapshot)>,
-    media_tx: Sender<isize>,
     mut volume: u8,
     open: impl Fn(u8, &[Stream]) -> crate::error::Result<Box<dyn crate::engine::EngineImpl>>,
 ) {
@@ -170,8 +157,7 @@ fn worker_with(
             }
             Ok(Request::Play(request_generation, streams)) => {
                 generation = request_generation;
-                // Engine capability is a property of this station, not of the
-                // previously playing one. Retire it before selecting again.
+                // Retire the previous pipeline before opening the new station.
                 engine = None;
                 match open(volume, &streams) {
                     Ok(opened) => engine = Some(opened),
@@ -216,9 +202,6 @@ fn worker_with(
             } else {
                 if updates.send((generation, active.snapshot())).is_err() {
                     break;
-                }
-                for direction in active.take_media() {
-                    let _ = media_tx.send(direction);
                 }
             }
         }
@@ -306,8 +289,7 @@ pub(crate) fn host(url: &str) -> &str {
 
 /// A per-channel loudness meter fed with 20 Hz RMS readings in dB. The
 /// normalization (rolling percentiles, attack/release easing) is
-/// engine-independent: the mpv engine converts its af-metadata reply to dB,
-/// the native engine measures decoded samples directly.
+/// fed by decoded samples consumed by the native output callback.
 #[derive(Default)]
 pub(crate) struct AudioMeter {
     channels: [ChannelMeter; 2],
@@ -382,7 +364,6 @@ pub(crate) mod tests {
             Player {
                 tx,
                 rx,
-                media_rx: mpsc::channel().1,
                 generation: 0,
                 last_update: Instant::now(),
                 worker: None,
@@ -568,9 +549,6 @@ pub(crate) mod tests {
                     ..Snapshot::default()
                 }
             }
-            fn take_media(&mut self) -> Vec<isize> {
-                Vec::new()
-            }
         }
         impl Drop for FakeEngine {
             fn drop(&mut self) {
@@ -579,10 +557,9 @@ pub(crate) mod tests {
         }
         let (commands_tx, commands_rx) = mpsc::channel();
         let (updates_tx, updates_rx) = mpsc::channel();
-        let (media_tx, _media_rx) = mpsc::channel();
         let (events_tx, events_rx) = mpsc::channel();
         let worker = thread::spawn(move || {
-            worker_with(commands_rx, updates_tx, media_tx, 80, |volume, streams| {
+            worker_with(commands_rx, updates_tx, 80, |volume, streams| {
                 events_tx
                     .send(format!("open:{:?}:{volume}", streams[0].kind))
                     .unwrap();

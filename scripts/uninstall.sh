@@ -1,7 +1,7 @@
 #!/bin/sh
 
-# Removes the radiome binary installed by scripts/install.sh.
-# Settings are kept unless RADIOME_PURGE=1 is set or --purge is passed.
+# Removes the radio-record binary installed by scripts/install.sh.
+# Settings are kept unless RADIO_RECORD_PURGE=1 is set or --purge is passed.
 
 set -eu
 
@@ -10,10 +10,10 @@ die() {
 	exit 1
 }
 
-prefix=${RADIOME_PREFIX:-$HOME/.local}
+prefix=${RADIO_RECORD_PREFIX:-$HOME/.local}
 bin_dir=$prefix/bin
-binary=$bin_dir/radiome
-purge=${RADIOME_PURGE:-0}
+binary=$bin_dir/radio-record
+purge=${RADIO_RECORD_PURGE:-0}
 
 for arg in "$@"; do
 	case "$arg" in
@@ -27,7 +27,7 @@ for arg in "$@"; do
 				"Removes $binary." \
 				"  --purge   also delete favorites and volume (settings.json)" \
 				"" \
-				"Environment: RADIOME_PREFIX (default \$HOME/.local), RADIOME_PURGE=1"
+				"Environment: RADIO_RECORD_PREFIX (default \$HOME/.local), RADIO_RECORD_PURGE=1"
 			exit 0
 			;;
 		*)
@@ -36,13 +36,13 @@ for arg in "$@"; do
 	esac
 done
 
-# Same precedence as the app: RADIOME_CONFIG_DIR, $XDG_CONFIG_HOME/radiome, ~/.config/radiome.
-if [ -n "${RADIOME_CONFIG_DIR:-}" ]; then
-	config_dir=$RADIOME_CONFIG_DIR
+# Same precedence as the app: RADIO_RECORD_CONFIG_DIR, $XDG_CONFIG_HOME/radio-record, ~/.config/radio-record.
+if [ -n "${RADIO_RECORD_CONFIG_DIR:-}" ]; then
+	config_dir=$RADIO_RECORD_CONFIG_DIR
 elif [ -n "${XDG_CONFIG_HOME:-}" ]; then
-	config_dir=$XDG_CONFIG_HOME/radiome
+	config_dir=$XDG_CONFIG_HOME/radio-record
 else
-	config_dir=$HOME/.config/radiome
+	config_dir=$HOME/.config/radio-record
 fi
 
 if [ -f "$binary" ]; then

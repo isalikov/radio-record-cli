@@ -25,14 +25,14 @@ impl Default for Settings {
 
 impl Settings {
     pub fn path() -> Result<PathBuf> {
-        if let Some(path) = std::env::var_os("RADIOME_CONFIG_DIR") {
+        if let Some(path) = std::env::var_os("RADIO_RECORD_CONFIG_DIR") {
             return Ok(PathBuf::from(path).join("settings.json"));
         }
         if let Some(path) = std::env::var_os("XDG_CONFIG_HOME") {
-            return Ok(PathBuf::from(path).join("radiome/settings.json"));
+            return Ok(PathBuf::from(path).join("radio-record/settings.json"));
         }
         let home = std::env::var_os("HOME").ok_or_else(|| Error::new("HOME is not set"))?;
-        Ok(PathBuf::from(home).join(".config/radiome/settings.json"))
+        Ok(PathBuf::from(home).join(".config/radio-record/settings.json"))
     }
 
     pub fn load(path: &Path) -> Result<Self> {

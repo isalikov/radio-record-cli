@@ -152,7 +152,7 @@ impl EngineImpl for NativeEngine {
         if playable.is_empty() {
             self.snapshot.state = PlayerState::Error;
             self.snapshot.error =
-                Some("HE-AAC stream needs mpv · install mpv or Enter to retry".into());
+                Some("HE-AAC streams are unsupported · select another station".into());
             return;
         }
         self.snapshot.state = PlayerState::Buffering;
@@ -241,9 +241,6 @@ impl EngineImpl for NativeEngine {
 
     fn snapshot(&self) -> Snapshot {
         self.snapshot.clone()
-    }
-    fn take_media(&mut self) -> Vec<isize> {
-        Vec::new()
     }
 }
 
@@ -343,6 +340,7 @@ struct OutputCallback {
     consumer: Consumer<f32>,
     output: Arc<OutputState>,
     resample: Resample,
+    output_channels: usize,
     epoch: u64,
     start_fill: usize,
     playing: bool,
@@ -358,6 +356,7 @@ impl OutputCallback {
             epoch: output.pause_epoch.load(Ordering::Acquire),
             output,
             resample: Resample::new(rate, device_rate),
+            output_channels: 2,
             start_fill: start_fill(rate as usize),
             playing: false,
             meter_window: (device_rate as usize / 20).max(1),
@@ -376,7 +375,7 @@ impl OutputCallback {
             for _ in 0..queued {
                 let _ = self.consumer.pop();
             }
-            self.resample = Resample::new(self.resample.in_rate, self.resample.out_rate);
+            self.resample.reset();
             self.epoch = epoch;
             self.playing = false;
             self.meter_count = 0;
@@ -387,7 +386,7 @@ impl OutputCallback {
         }
         let gain = self.output.volume.load(Ordering::Relaxed) as f32 / 100.0;
         let mut starved = false;
-        for frame in data.chunks_mut(2) {
+        for frame in data.chunks_mut(self.output_channels) {
             let samples = if !paused && self.playing {
                 match self.resample.frame(&mut self.consumer) {
                     Some(samples) => {
@@ -405,7 +404,12 @@ impl OutputCallback {
             } else {
                 [0.0; 2]
             };
-            frame[0] = T::from_sample((samples[0] * gain).clamp(-1.0, 1.0));
+            let left = if self.output_channels == 1 {
+                (samples[0] + samples[1]) * 0.5
+            } else {
+                samples[0]
+            };
+            frame[0] = T::from_sample((left * gain).clamp(-1.0, 1.0));
             if let Some(right) = frame.get_mut(1) {
                 *right = T::from_sample((samples[1] * gain).clamp(-1.0, 1.0));
             }
@@ -443,8 +447,8 @@ impl OutputCallback {
     }
 }
 
-/// Whether a default output device exists, so engine selection can fall
-/// back to mpv before a station is even tried.
+/// Whether the optional live output test has a device to exercise.
+#[cfg(test)]
 pub(crate) fn device_available() -> bool {
     use cpal::traits::HostTrait;
     cpal::default_host().default_output_device().is_some()
@@ -453,8 +457,8 @@ pub(crate) fn device_available() -> bool {
 /// Frame-rate conversion between the stream and the output device using
 /// linear interpolation, so Bluetooth headsets that only offer 48 kHz can
 /// still play 44.1 kHz radio. All state lives inside the output callback:
-/// no locks, no allocation. Upsampling only — a device slower than the
-/// stream is refused instead of aliased.
+/// no locks, no allocation. Downsampling filters out frequencies above the
+/// output Nyquist limit before interpolation to avoid audible aliasing.
 struct Resample {
     in_rate: u32,
     out_rate: u32,
@@ -464,6 +468,7 @@ struct Resample {
     a: [f32; 2],
     b: [f32; 2],
     primed: bool,
+    lowpass: Option<LowPass>,
 }
 
 impl Resample {
@@ -476,7 +481,26 @@ impl Resample {
             a: [0.0; 2],
             b: [0.0; 2],
             primed: false,
+            lowpass: (out_rate < in_rate).then(|| LowPass::new(in_rate, out_rate)),
         }
+    }
+
+    fn reset(&mut self) {
+        self.frac = 0.0;
+        self.a = [0.0; 2];
+        self.b = [0.0; 2];
+        self.primed = false;
+        if let Some(filter) = &mut self.lowpass {
+            filter.reset();
+        }
+    }
+
+    fn pop(&mut self, consumer: &mut Consumer<f32>) -> Option<[f32; 2]> {
+        let frame = pop_frame(consumer)?;
+        Some(match &mut self.lowpass {
+            Some(filter) => filter.frame(frame),
+            None => frame,
+        })
     }
 
     /// One output frame, popping input frames from the ring as needed.
@@ -490,12 +514,12 @@ impl Resample {
             if consumer.slots() < 4 {
                 return None;
             }
-            self.a = pop_frame(consumer)?;
-            self.b = pop_frame(consumer)?;
+            self.a = self.pop(consumer)?;
+            self.b = self.pop(consumer)?;
             self.primed = true;
         }
         while self.frac >= 1.0 {
-            let next = pop_frame(consumer)?;
+            let next = self.pop(consumer)?;
             self.a = self.b;
             self.b = next;
             self.frac -= 1.0;
@@ -519,27 +543,98 @@ fn pop_frame(consumer: &mut Consumer<f32>) -> Option<[f32; 2]> {
     Some([left, right])
 }
 
-/// The device rate to open for a stream of `rate` Hz: the stream rate when
-/// the device supports it, else the closest supported rate that is not below
-/// it. Prefer the current device rate when it supports upsampling or pass-through.
-/// `None` means every config is slower than the stream.
-fn device_rate(min: u32, max: u32, rate: u32, current: Option<u32>) -> Option<u32> {
-    // Keeping the device clock avoids a CoreAudio rate-change handshake, which
-    // can time out on headphones even when the advertised range includes rate.
-    if let Some(current) = current
-        && current >= rate
-        && min <= current
-        && current <= max
+// Fixed storage and coefficients built before the stream starts: reset and
+// convolution stay allocation-free on the audio thread. Blackman-windowed sinc
+// leaves a transition band below output Nyquist, including headset call rates.
+const FILTER_TAPS: usize = 64;
+struct LowPass {
+    coefficients: [f32; FILTER_TAPS],
+    history: [[f32; 2]; FILTER_TAPS],
+    next: usize,
+}
+
+impl LowPass {
+    fn new(in_rate: u32, out_rate: u32) -> Self {
+        let cutoff = 0.45 * f64::from(out_rate) / f64::from(in_rate);
+        let mut coefficients = [0.0; FILTER_TAPS];
+        for (i, coefficient) in coefficients.iter_mut().enumerate() {
+            let x = i as f64 - (FILTER_TAPS - 1) as f64 / 2.0;
+            let sinc = (2.0 * std::f64::consts::PI * cutoff * x).sin() / (std::f64::consts::PI * x);
+            let phase = 2.0 * std::f64::consts::PI * i as f64 / (FILTER_TAPS - 1) as f64;
+            let window = 0.42 - 0.5 * phase.cos() + 0.08 * (2.0 * phase).cos();
+            *coefficient = (sinc * window) as f32;
+        }
+        let sum: f32 = coefficients.iter().sum();
+        for coefficient in &mut coefficients {
+            *coefficient /= sum;
+        }
+        Self {
+            coefficients,
+            history: [[0.0; 2]; FILTER_TAPS],
+            next: 0,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.history.fill([0.0; 2]);
+        self.next = 0;
+    }
+
+    fn frame(&mut self, frame: [f32; 2]) -> [f32; 2] {
+        self.history[self.next] = frame;
+        let mut result = [0.0; 2];
+        for (i, coefficient) in self.coefficients.iter().enumerate() {
+            let sample = self.history[(self.next + FILTER_TAPS - i) % FILTER_TAPS];
+            result[0] += sample[0] * coefficient;
+            result[1] += sample[1] * coefficient;
+        }
+        self.next = (self.next + 1) % FILTER_TAPS;
+        result
+    }
+}
+
+fn usable_output(channels: u16, format: cpal::SampleFormat) -> bool {
+    matches!(channels, 1 | 2) && matches!(format, cpal::SampleFormat::F32 | cpal::SampleFormat::I16)
+}
+
+/// Prefer the exact current device format, even a lower-rate headset call
+/// format. Only enumerate alternatives if the default cannot be used.
+fn select_output(
+    default: Option<cpal::SupportedStreamConfig>,
+    alternatives: impl FnOnce() -> Result<Vec<cpal::SupportedStreamConfigRange>>,
+    rate: u32,
+) -> Result<cpal::SupportedStreamConfig> {
+    if let Some(config) = default
+        && config.sample_rate() > 0
+        && usable_output(config.channels(), config.sample_format())
     {
-        return Some(current);
+        return Ok(config);
     }
-    if min <= rate && rate <= max {
-        Some(rate)
-    } else if rate < min {
-        Some(min)
-    } else {
-        None
+    alternatives()?
+        .into_iter()
+        .filter(|config| usable_output(config.channels(), config.sample_format()))
+        .filter_map(|config| {
+            let min = config.min_sample_rate();
+            let max = config.max_sample_rate();
+            (min > 0 && max >= min).then(|| config.with_sample_rate(rate.clamp(min, max)))
+        })
+        .min_by_key(|config| (config.sample_rate().abs_diff(rate), config.channels() != 2))
+        .ok_or_else(|| Error::new("the audio device has no supported mono or stereo output"))
+}
+
+fn current_output_config(device: &cpal::Device) -> Option<cpal::SupportedStreamConfig> {
+    use cpal::traits::DeviceTrait;
+    let config = device.default_output_config().ok()?;
+    #[cfg(target_os = "macos")]
+    if let Some(rate) = super::coreaudio::default_output_rate() {
+        return Some(cpal::SupportedStreamConfig::new(
+            config.channels(),
+            rate,
+            *config.buffer_size(),
+            config.sample_format(),
+        ));
     }
+    Some(config)
 }
 
 /// CPAL also reports nonfatal notifications through its error callback.
@@ -593,46 +688,24 @@ pub(crate) fn cpal_sink(
     let device = host
         .default_output_device()
         .ok_or_else(|| Error::new("no audio output device"))?;
-    let configs = device
-        .supported_output_configs()
-        .map_err(|err| Error::new(format!("audio device query failed: {err}")))?;
-    let current_rate = device
-        .default_output_config()
-        .ok()
-        .map(|config| config.sample_rate());
-    // Preserve the device clock whenever possible; otherwise choose the closest
-    // supported rate not below the stream. Faster output is resampled up.
-    let supported = configs
-        .into_iter()
-        .filter(|config| {
-            config.channels() == 2
-                && matches!(
-                    config.sample_format(),
-                    cpal::SampleFormat::F32 | cpal::SampleFormat::I16
-                )
-        })
-        .filter_map(|config| {
-            device_rate(
-                config.min_sample_rate(),
-                config.max_sample_rate(),
-                rate,
-                current_rate,
-            )
-            .map(|open_rate| (config, open_rate))
-        })
-        .min_by_key(|&(_, open_rate)| (Some(open_rate) != current_rate, open_rate))
-        .ok_or_else(|| {
-            Error::new(format!(
-                "the audio device does not support {rate} Hz stereo"
-            ))
-        })?;
-    let (supported, open_rate) = (supported.0, supported.1);
+    let supported = select_output(
+        current_output_config(&device),
+        || {
+            device
+                .supported_output_configs()
+                .map(|configs| configs.into_iter().collect())
+                .map_err(|err| Error::new(format!("audio device query failed: {err}")))
+        },
+        rate,
+    )?;
+    let open_rate = supported.sample_rate();
     let config = cpal::StreamConfig {
-        channels: 2,
+        channels: supported.channels(),
         sample_rate: open_rate,
         buffer_size: cpal::BufferSize::Default,
     };
-    let callback = OutputCallback::new(consumer, output, rate, open_rate);
+    let mut callback = OutputCallback::new(consumer, output, rate, open_rate);
+    callback.output_channels = usize::from(config.channels);
     let failed = std::sync::Arc::new(AtomicBool::new(false));
     let stream = match supported.sample_format() {
         cpal::SampleFormat::F32 => build_stream::<f32>(&device, config, failed.clone(), callback)?,
@@ -1289,25 +1362,41 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn output_rate_preserves_device_clock_when_resampling_is_supported() {
-        assert_eq!(
-            device_rate(44_100, 96_000, 44_100, Some(48_000)),
-            Some(48_000)
-        );
-        assert_eq!(
-            device_rate(44_100, 96_000, 48_000, Some(48_000)),
-            Some(48_000)
-        );
-        // A slower or out-of-range clock cannot be used by our upsampler.
-        assert_eq!(
-            device_rate(44_100, 96_000, 48_000, Some(44_100)),
-            Some(48_000)
-        );
-        assert_eq!(
-            device_rate(44_100, 48_000, 44_100, Some(96_000)),
-            Some(44_100)
-        );
-        assert_eq!(device_rate(44_100, 48_000, 96_000, Some(48_000)), None);
+    fn output_preserves_headset_call_format_without_querying_music_rates() {
+        for channels in [1, 2] {
+            let current = cpal::SupportedStreamConfig::new(
+                channels,
+                24_000,
+                cpal::SupportedBufferSize::Unknown,
+                cpal::SampleFormat::F32,
+            );
+            let selected =
+                select_output(Some(current), || panic!("current format is usable"), 44_100)
+                    .unwrap();
+            assert_eq!(selected.sample_rate(), 24_000);
+            assert_eq!(selected.channels(), channels);
+        }
+    }
+
+    #[test]
+    fn output_can_choose_a_lower_rate_when_no_default_format_is_available() {
+        let selected = select_output(
+            None,
+            || {
+                Ok(vec![cpal::SupportedStreamConfigRange::new(
+                    1,
+                    16_000,
+                    24_000,
+                    cpal::SupportedBufferSize::Unknown,
+                    cpal::SampleFormat::I16,
+                )])
+            },
+            44_100,
+        )
+        .unwrap();
+        assert_eq!(selected.sample_rate(), 24_000);
+        assert_eq!(selected.channels(), 1);
+        assert!(select_output(None, || Ok(vec![]), 44_100).is_err());
     }
 
     #[test]
@@ -1326,6 +1415,67 @@ pub(crate) mod tests {
             );
         }
         assert!(resample.frame(&mut consumer).is_none(), "ring is drained");
+    }
+
+    #[test]
+    fn downsampling_keeps_pitch_and_rejects_out_of_band_aliases() {
+        fn rms(frequency: f32) -> (f64, usize) {
+            let (mut producer, mut consumer) = RingBuffer::new(44_100 * 2);
+            for i in 0..22_050 {
+                let sample = (2.0 * std::f32::consts::PI * frequency * i as f32 / 44_100.0).sin();
+                producer.push_entire_slice(&[sample, sample]).unwrap();
+            }
+            let mut resample = Resample::new(44_100, 24_000);
+            let mut squares = 0.0;
+            let mut count = 0;
+            let mut frames = 0;
+            while let Some(frame) = resample.frame(&mut consumer) {
+                frames += 1;
+                if frames > 200 {
+                    squares += f64::from(frame[0]).powi(2);
+                    count += 1;
+                }
+            }
+            ((squares / count as f64).sqrt(), frames)
+        }
+        let (in_band, frames) = rms(2_000.0);
+        let (out_of_band, _) = rms(18_000.0);
+        assert!(
+            (11_990..=12_010).contains(&frames),
+            "0.5 seconds must keep its duration: {frames}"
+        );
+        assert!(in_band > 0.65, "music-band audio must survive: {in_band}");
+        assert!(
+            out_of_band < 0.005,
+            "18 kHz must not alias into the 24 kHz output: {out_of_band}"
+        );
+    }
+
+    #[test]
+    fn downsampling_pause_clears_filter_history_and_mono_averages_channels() {
+        let output = Arc::new(OutputState::new(100));
+        let (mut producer, consumer) = RingBuffer::new(4096);
+        for _ in 0..1024 {
+            producer.push_entire_slice(&[0.75, 0.25]).unwrap();
+        }
+        let mut callback = OutputCallback::new(consumer, output.clone(), 1000, 500);
+        callback.output_channels = 1;
+        let mut data = [0.0f32; 200];
+        callback.fill(&mut data);
+        assert!((data[199] - 0.5).abs() < 1e-5, "mono mixes both channels");
+        output.pause_epoch.fetch_add(1, Ordering::AcqRel);
+        output.paused.store(true, Ordering::Release);
+        callback.fill(&mut data);
+        assert_eq!(data, [0.0; 200]);
+        output.paused.store(false, Ordering::Release);
+        for _ in 0..1024 {
+            producer.push_entire_slice(&[0.0, 0.0]).unwrap();
+        }
+        callback.fill(&mut data);
+        assert_eq!(
+            data, [0.0; 200],
+            "the filter must not replay audio after resume"
+        );
     }
 
     #[test]
@@ -1349,14 +1499,6 @@ pub(crate) mod tests {
         let _ = producer.push_entire_slice(&[4.0, 4.0]);
         let third = resample.frame(&mut consumer).expect("must resume");
         assert_eq!(third, [2.0, 2.0]);
-    }
-
-    #[test]
-    fn device_rate_prefers_the_stream_and_refuses_slower_devices() {
-        assert_eq!(device_rate(44_100, 48_000, 44_100, None), Some(44_100));
-        assert_eq!(device_rate(48_000, 48_000, 44_100, None), Some(48_000));
-        assert_eq!(device_rate(48_000, 96_000, 44_100, None), Some(48_000));
-        assert_eq!(device_rate(24_000, 24_000, 44_100, None), None);
     }
 
     fn reader_shared(output: Arc<OutputState>) -> ReaderShared {
@@ -1677,7 +1819,12 @@ pub(crate) mod tests {
         engine.tick().unwrap();
         let snapshot = engine.snapshot();
         assert_eq!(snapshot.state, PlayerState::Error);
-        assert!(snapshot.error.unwrap().contains("needs mpv"));
+        assert!(
+            snapshot
+                .error
+                .unwrap()
+                .contains("HE-AAC streams are unsupported")
+        );
     }
 
     #[test]
@@ -1770,6 +1917,33 @@ pub(crate) mod tests {
         assert_eq!(
             engine.snapshot.underruns, underruns,
             "HLS must remain continuous"
+        );
+    }
+
+    #[test]
+    #[ignore = "opens a real audio device with silent output"]
+    fn live_device_opens_current_format_silently() {
+        use cpal::traits::HostTrait;
+        let device = cpal::default_host()
+            .default_output_device()
+            .expect("default audio output");
+        let before = current_output_config(&device).unwrap();
+        let (_producer, consumer) = RingBuffer::new(RING_CAPACITY);
+        let output = Arc::new(OutputState::new(0));
+        let sink = cpal_sink(consumer, output, 44_100).expect("current device format must open");
+        thread::sleep(Duration::from_millis(100));
+        assert!(!sink.failed());
+        let after = current_output_config(&device).unwrap();
+        assert_eq!(
+            after.sample_rate(),
+            before.sample_rate(),
+            "do not change the device clock"
+        );
+        assert_eq!(after.channels(), before.channels());
+        eprintln!(
+            "Opened silent output at {} Hz, {} channels",
+            before.sample_rate(),
+            before.channels()
         );
     }
 

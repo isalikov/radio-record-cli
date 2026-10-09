@@ -5,7 +5,7 @@ description: Bring README.md (and CHANGELOG.md) in line with player changes. Use
 
 # README sync
 
-README.md is the user manual for radiome. Every player change must be reflected there in the same session, before suggesting a commit message.
+README.md is the user manual for radio-record. Every player change must be reflected there in the same session, before suggesting a commit message.
 
 ## What to check
 
@@ -13,9 +13,9 @@ Read `README.md` and compare each section against the current code:
 
 | Section | Source of truth |
 | --- | --- |
-| Run / requirements | `Cargo.toml`, external tools spawned in `src/api.rs` (curl) and `src/player.rs` (mpv) |
+| Run / requirements | `Cargo.toml`, built-in HTTP transport and native audio output in `src/engine/native.rs` |
 | Keyboard table | `App::key` in `src/app.rs`, help text in `ui::help` |
-| Audio and settings | `AudioMeter`, `Engine::new` mpv args, `Settings` fields and path precedence, env vars (`RADIOME_BASE_URL`, `RADIOME_CONFIG_DIR`), stream priority in `Station::stream_url`, refresh interval in `main.rs` |
+| Audio and settings | `AudioMeter`, native output format and resampling, `Settings` fields and path precedence, env vars (`RADIO_RECORD_BASE_URL`, `RADIO_RECORD_CONFIG_DIR`), stream priority in `Station::stream_url`, refresh interval in `main.rs` |
 | Verify | `Makefile` targets |
 
 ## Steps

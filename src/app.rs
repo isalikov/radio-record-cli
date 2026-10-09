@@ -46,9 +46,11 @@ pub enum Action {
     Stop,
     Volume(u8),
     Refresh,
+    Account(crate::account::Command),
 }
 
 pub struct App {
+    pub account: crate::account::Account,
     pub catalog: Option<Catalog>,
     pub categories: Vec<Category>,
     pub category: ListState,
@@ -76,6 +78,7 @@ pub struct App {
 impl App {
     pub fn new(settings: Settings) -> Self {
         Self {
+            account: crate::account::Account::default(),
             catalog: None,
             categories: vec![Category::All, Category::Favorites],
             category: ListState::default().with_selected(Some(0)),
@@ -182,6 +185,15 @@ impl App {
         });
     }
 
+    pub fn replace_favorites(&mut self, favorites: std::collections::BTreeSet<i64>) {
+        if self.settings.favorites != favorites {
+            self.settings.favorites = favorites;
+            self.dirty = true;
+            let count = self.visible().len();
+            clamp_selection(&mut self.stations, count);
+        }
+    }
+
     pub fn set_history(&mut self, station_id: i64, history: Vec<Track>) {
         if self.now.as_ref().map(|station| station.id) != Some(station_id) {
             return;
@@ -250,6 +262,9 @@ impl App {
             }
             _ => {}
         }
+        if self.account.open {
+            return self.account.key(key).map_or(Action::None, Action::Account);
+        }
         if self.help {
             match key.code {
                 KeyCode::Down | KeyCode::Char('j') => {
@@ -285,6 +300,7 @@ impl App {
                 self.help_scroll = 0;
             }
             KeyCode::Char('d') => self.show_diag = true,
+            KeyCode::Char('a') => self.account.open = true,
             KeyCode::Esc => self.error = None,
             KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => self.change_category(-1),
             KeyCode::Tab => self.change_category(1),
@@ -310,9 +326,9 @@ impl App {
             }
             KeyCode::Char('-') | KeyCode::Char('=') | KeyCode::Char('+') => {
                 self.settings.volume = if key.code == KeyCode::Char('-') {
-                    self.settings.volume.saturating_sub(5)
+                    self.settings.volume.saturating_sub(2)
                 } else {
-                    self.settings.volume.saturating_add(5).min(100)
+                    self.settings.volume.saturating_add(2).min(100)
                 };
                 self.dirty = true;
                 return Action::Volume(self.settings.volume);
@@ -581,11 +597,20 @@ pub mod tests {
     #[test]
     fn volume_is_bounded_and_search_is_removed() {
         let mut app = fixture();
-        for _ in 0..30 {
+        app.settings.volume = 65;
+        assert!(matches!(
+            press(&mut app, KeyCode::Char('=')),
+            Action::Volume(67)
+        ));
+        assert!(matches!(
+            press(&mut app, KeyCode::Char('-')),
+            Action::Volume(65)
+        ));
+        for _ in 0..60 {
             press(&mut app, KeyCode::Char('='));
         }
         assert_eq!(app.settings.volume, 100);
-        for _ in 0..30 {
+        for _ in 0..60 {
             press(&mut app, KeyCode::Char('-'));
         }
         assert_eq!(app.settings.volume, 0);

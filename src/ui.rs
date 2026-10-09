@@ -1,4 +1,5 @@
 use crate::{
+    account::{Choice, merge},
     app::{App, Category},
     player::{PlayerState, STREAM_ROUNDS},
 };
@@ -91,12 +92,12 @@ impl Theme {
         }
     }
 
-    /// Theme names accepted by `RADIOME_THEME`.
+    /// Theme names accepted by `RADIO_RECORD_THEME`.
     pub fn known() -> &'static [&'static str] {
         &["default", "amber", "phosphor", "paper"]
     }
 
-    /// Map a `RADIOME_THEME` value (and the `NO_COLOR` flag) to a palette.
+    /// Map a `RADIO_RECORD_THEME` value (and the `NO_COLOR` flag) to a palette.
     /// `NO_COLOR` wins; unknown and empty names fall back to the default theme.
     pub fn resolve(no_color: bool, name: Option<&str>) -> Self {
         if no_color {
@@ -111,15 +112,15 @@ impl Theme {
     }
 }
 
-/// Resolve the startup theme from `RADIOME_THEME` and `NO_COLOR`. An unknown
+/// Resolve the startup theme from `RADIO_RECORD_THEME` and `NO_COLOR`. An unknown
 /// name falls back to the default theme with a note on stderr. Called once at
 /// startup, before the terminal takes over the screen.
 pub fn theme_from_env() -> Theme {
     let no_color = std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty());
-    let name = std::env::var("RADIOME_THEME").unwrap_or_default();
+    let name = std::env::var("RADIO_RECORD_THEME").unwrap_or_default();
     let name = name.trim();
     if !no_color && !name.is_empty() && !Theme::known().contains(&name) {
-        eprintln!("radiome: unknown RADIOME_THEME '{name}', using default");
+        eprintln!("radio-record: unknown RADIO_RECORD_THEME '{name}', using default");
     }
     Theme::resolve(no_color, Some(name))
 }
@@ -162,6 +163,9 @@ pub fn render(frame: &mut Frame, app: &mut App, theme: &Theme) {
     if app.show_diag {
         diag(frame, area, app, theme);
     }
+    if app.account.open {
+        account(frame, area, app, theme);
+    }
 }
 
 fn panel<'a>(title: &'a str, theme: &Theme) -> Block<'a> {
@@ -176,6 +180,27 @@ fn panel<'a>(title: &'a str, theme: &Theme) -> Block<'a> {
 }
 
 fn categories(frame: &mut Frame, app: &mut App, area: Rect, theme: &Theme) {
+    let [area, hint] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(area);
+    let label = app
+        .account
+        .session
+        .as_ref()
+        .and(app.account.profile.as_ref())
+        .map(|profile| profile.email.as_str())
+        .filter(|email| !email.is_empty())
+        .unwrap_or("Account");
+    let suffix = if app.account.conflict.is_some() || app.account.error.is_some() {
+        " !"
+    } else if app.account.busy {
+        " …"
+    } else {
+        ""
+    };
+    let state = format!("a {label}{suffix}");
+    frame.render_widget(
+        Paragraph::new(state).style(Style::default().fg(theme.muted)),
+        hint,
+    );
     let block = panel("", theme)
         .borders(Borders::RIGHT)
         .padding(Padding::new(0, 1, 0, 0));
@@ -340,7 +365,7 @@ fn playback(frame: &mut Frame, app: &App, mut area: Rect, theme: &Theme) {
         .areas(Rect::new(area.x, area.y, area.width, 1));
     let symbol = match app.playback.state {
         PlayerState::Idle => "○".to_owned(),
-        // Real cache progress while the stream fills; a bare dot until mpv answers.
+        // Real cache progress while the stream fills; a bare dot until the engine reports progress.
         PlayerState::Buffering => match app.playback.buffering {
             Some(percent) => format!("· {percent}%"),
             None => "·".to_owned(),
@@ -531,9 +556,222 @@ fn meter(width: u16, level: f64, theme: &Theme) -> Line<'static> {
     Line::from(spans)
 }
 
+fn account(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
+    let account = &app.account;
+    let width = 66.min(area.width.saturating_sub(4));
+    let height = if account.conflict.is_some() { 18 } else { 14 }.min(area.height);
+    let popup = Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y + (area.height - height) / 2,
+        width,
+        height,
+    );
+    let inner_width = width.saturating_sub(4) as usize;
+    let clip = |text: &str| -> String {
+        if text.chars().count() <= inner_width {
+            text.to_owned()
+        } else {
+            format!(
+                "{}…",
+                text.chars()
+                    .take(inner_width.saturating_sub(1))
+                    .collect::<String>()
+            )
+        }
+    };
+    let muted = |text: String| Line::from(Span::styled(text, Style::default().fg(theme.muted)));
+    let mut lines = Vec::new();
+    let title;
+    let hint;
+    if account.logout_confirm {
+        title = " Sign out ";
+        hint = " Enter confirm · Esc cancel ";
+        lines.push(Line::raw("Sign out of Radio Record?"));
+        lines.push(Line::raw("Local favorites will be kept."));
+        lines.push(muted("Pending sync will be cancelled.".into()));
+    } else if let Some(conflict) = &account.conflict {
+        title = " Resolve favorites ";
+        hint = " ↑↓ choose · Enter apply · Esc later ";
+        let local = &app.settings.favorites;
+        let remote = &conflict.remote;
+        let base = account.session.as_ref().and_then(|s| s.baseline.as_ref());
+        let combined = merge(base, local, remote);
+        lines.push(Line::raw(format!(
+            "Local {} · Server {} · Shared {}",
+            local.len(),
+            remote.len(),
+            local.intersection(remote).count()
+        )));
+        if height >= 16 {
+            let names = |ids: Vec<i64>| -> String {
+                let names: Vec<_> = ids
+                    .iter()
+                    .take(3)
+                    .map(|id| {
+                        app.catalog
+                            .as_ref()
+                            .and_then(|c| c.stations.iter().find(|s| s.id == *id))
+                            .map(|s| s.title.clone())
+                            .unwrap_or_else(|| format!("#{id}"))
+                    })
+                    .collect();
+                if names.is_empty() {
+                    "none".into()
+                } else {
+                    names.join(", ")
+                }
+            };
+            lines.push(muted(clip(&format!(
+                "Only local: {}",
+                names(local.difference(remote).copied().collect())
+            ))));
+            lines.push(muted(clip(&format!(
+                "Only server: {}",
+                names(remote.difference(local).copied().collect())
+            ))));
+        }
+        lines.push(Line::raw(""));
+        for (choice, label, count) in [
+            (Choice::Merge, "1  Merge both", combined.len()),
+            (Choice::Local, "2  Use local on both", local.len()),
+            (Choice::Server, "3  Use server on both", remote.len()),
+        ] {
+            let selected = choice == conflict.choice;
+            lines.push(Line::from(Span::styled(
+                format!("{} {label} ({count})", if selected { "›" } else { " " }),
+                Style::default().fg(if selected { theme.accent } else { theme.fg }),
+            )));
+        }
+        let target = match conflict.choice {
+            Choice::Merge => &combined,
+            Choice::Local => local,
+            Choice::Server => remote,
+        };
+        lines.push(Line::raw(""));
+        lines.push(muted(format!(
+            "Local: +{} / −{}",
+            target.difference(local).count(),
+            local.difference(target).count()
+        )));
+        lines.push(muted(format!(
+            "Server: +{} / −{}",
+            target.difference(remote).count(),
+            remote.difference(target).count()
+        )));
+        if height >= 16 {
+            lines.push(muted(
+                if base.is_some() {
+                    "Merge honors deletions since last sync."
+                } else {
+                    "First merge keeps all favorites."
+                }
+                .into(),
+            ));
+            lines.push(muted("Changes apply only after Enter.".into()));
+        }
+    } else if account.session.is_some() {
+        title = " Radio Record account ";
+        hint = " s sync · l sign out · Esc close ";
+        if let Some(profile) = &account.profile {
+            lines.push(Line::raw(clip(&profile.email)));
+            if !profile.name.is_empty() {
+                lines.push(muted(clip(&profile.name)));
+            }
+            lines.push(Line::raw(if profile.premium {
+                "Premium account"
+            } else {
+                "Free account"
+            }));
+        } else {
+            lines.push(Line::raw("Restoring account…"));
+        }
+        lines.push(Line::raw(format!(
+            "{} favorite stations locally",
+            app.settings.favorites.len()
+        )));
+        let pending = account
+            .session
+            .as_ref()
+            .and_then(|s| s.baseline.as_ref())
+            .is_none_or(|base| *base != app.settings.favorites);
+        let status = if account.busy {
+            "Syncing favorites…".to_owned()
+        } else if pending {
+            "Local changes pending sync".to_owned()
+        } else if let Some(instant) = account.last_sync {
+            format!("Synced {}s ago", instant.elapsed().as_secs())
+        } else {
+            "Ready to sync".to_owned()
+        };
+        lines.push(muted(status));
+        lines.push(Line::raw(""));
+        lines.push(Line::raw("s  Sync favorites now"));
+        lines.push(Line::raw("l  Sign out / change account"));
+    } else {
+        title = " Sign in to Radio Record ";
+        hint = " Tab field · Enter sign in · Esc close ";
+        lines.push(muted("Use your Radio Record email account.".into()));
+        lines.push(Line::raw(""));
+        lines.push(Line::from(Span::styled(
+            format!("{} Email", if !account.password_focus { "›" } else { " " }),
+            Style::default().fg(theme.accent),
+        )));
+        // Keep the end of a long input visible while typing.
+        let email: String = account
+            .email
+            .chars()
+            .rev()
+            .take(inner_width)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        lines.push(Line::raw(email));
+        lines.push(Line::from(Span::styled(
+            format!(
+                "{} Password",
+                if account.password_focus { "›" } else { " " }
+            ),
+            Style::default().fg(theme.accent),
+        )));
+        lines.push(Line::raw(
+            "*".repeat(account.password.chars().count().min(inner_width)),
+        ));
+        lines.push(Line::raw(""));
+        lines.push(muted(
+            if account.busy {
+                "Signing in…"
+            } else {
+                "Password is never saved."
+            }
+            .into(),
+        ));
+    }
+    if let Some(error) = &account.error {
+        lines.push(Line::from(Span::styled(
+            clip(error),
+            Style::default().fg(theme.alert),
+        )));
+    }
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(Style::default().fg(theme.fg).bg(theme.bg))
+            .block(
+                Block::default()
+                    .title(title)
+                    .title_bottom(hint)
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(theme.alert))
+                    .padding(Padding::horizontal(1)),
+            ),
+        popup,
+    );
+}
+
 fn help(frame: &mut Frame, area: Rect, scroll: u16, theme: &Theme) {
     let width = 52.min(area.width.saturating_sub(4));
-    let height = 18.min(area.height);
+    let height = 19.min(area.height);
     let popup = Rect::new(
         area.x + (area.width - width) / 2,
         area.y + (area.height - height) / 2,
@@ -547,11 +785,12 @@ fn help(frame: &mut Frame, area: Rect, scroll: u16, theme: &Theme) {
         ("Enter", "play station"),
         ("Space / F8", "play / pause"),
         ("F7 / F9", "previous / next station"),
-        ("− / =", "player volume"),
+        ("− / =", "player volume, 2% steps"),
         ("f", "toggle favorite"),
         ("Esc", "close"),
         ("i", "toggle history"),
         ("d", "diagnostics"),
+        ("a", "account / sync favorites"),
         ("PgUp PgDn Home End", "scroll"),
         ("r", "refresh"),
         ("s", "stop"),
@@ -568,14 +807,14 @@ fn help(frame: &mut Frame, area: Rect, scroll: u16, theme: &Theme) {
     frame.render_widget(
         Paragraph::new(lines)
             .scroll((
-                scroll.min(14u16.saturating_sub(height.saturating_sub(4))),
+                scroll.min(15u16.saturating_sub(height.saturating_sub(4))),
                 0,
             ))
             .style(Style::default().fg(theme.fg).bg(theme.bg))
             .block(
                 Block::default()
                     .title(" Keys ")
-                    .title_bottom(if height < 18 {
+                    .title_bottom(if height < 19 {
                         " ↑↓  ? / Esc "
                     } else {
                         " ? / Esc "
@@ -719,7 +958,7 @@ mod tests {
             .collect::<String>();
         assert!(text.contains("Record  +"));
         assert!(!text.contains(['♥', '♡']));
-        assert!(!text.contains("radiome"));
+        assert!(!text.contains("radio-record"));
         app.category.select(Some(1));
         terminal
             .draw(|frame| render(frame, &mut app, &theme))
@@ -861,6 +1100,52 @@ mod tests {
         assert!(!text.contains("generation"));
     }
 
+    #[test]
+    fn account_login_masks_password_and_fits_supported_terminal_sizes() {
+        for (width, height) in [(44, 12), (66, 18), (100, 30)] {
+            let mut app = fixture();
+            app.account.open = true;
+            app.account.email = "test@example.com".into();
+            app.account.password = "never-render-this".into();
+            app.account.password_focus = true;
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| render(frame, &mut app, &Theme::default()))
+                .unwrap();
+            let text = cell_text(terminal.backend().buffer());
+            assert!(text.contains("Sign in to Radio Record"));
+            assert!(text.contains("test@example.com"));
+            assert!(text.contains("*****************"));
+            assert!(!text.contains("never-render-this"));
+            assert!(text.contains("Enter sign in"));
+        }
+    }
+
+    #[test]
+    fn account_conflict_previews_choices_and_additions_and_removals() {
+        for (width, height) in [(44, 12), (66, 18), (100, 30)] {
+            let mut app = fixture();
+            app.account.open = true;
+            app.settings.favorites = [1, 2].into_iter().collect();
+            app.account.conflict = Some(crate::account::Conflict {
+                remote: [2, 3].into_iter().collect(),
+                choice: Choice::Server,
+            });
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| render(frame, &mut app, &Theme::default()))
+                .unwrap();
+            let text = cell_text(terminal.backend().buffer());
+            assert!(text.contains("Resolve favorites"));
+            assert!(text.contains("Merge both (3)"));
+            assert!(text.contains("Use local on both (2)"));
+            assert!(text.contains("Use server on both (2)"));
+            assert!(text.contains("Local: +1 / −1"));
+            assert!(text.contains("Server: +0 / −0"));
+            assert!(text.contains("Enter apply"));
+        }
+    }
+
     fn cell_text(buffer: &ratatui::buffer::Buffer) -> String {
         buffer
             .content()
@@ -919,7 +1204,7 @@ mod tests {
                     .iter()
                     .map(|cell| cell.symbol())
                     .collect::<String>();
-                assert!(!text.contains("radiome"));
+                assert!(!text.contains("radio-record"));
                 assert!(text.contains("Favorites"));
                 assert!(text.contains("Record"));
                 assert!(

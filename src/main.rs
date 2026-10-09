@@ -1,3 +1,4 @@
+mod account;
 mod api;
 mod app;
 mod engine;
@@ -23,7 +24,7 @@ use std::{
 
 fn main() {
     if let Err(err) = run() {
-        eprintln!("radiome: {err}");
+        eprintln!("radio-record: {err}");
         std::process::exit(1);
     }
 }
@@ -31,6 +32,7 @@ fn main() {
 struct TerminalGuard;
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
+        let _ = crossterm::execute!(io::stdout(), event::DisableBracketedPaste);
         ratatui::restore();
     }
 }
@@ -46,14 +48,16 @@ fn fetch<T: Send + 'static>(
 }
 
 struct Network {
+    account: account::Network,
     catalog: Option<Receiver<Result<Catalog>>>,
     history: Option<(i64, Receiver<Result<Vec<Track>>>)>,
     history_updated: Instant,
 }
 
 impl Network {
-    fn new() -> Self {
+    fn new(settings_path: &std::path::Path) -> Self {
         Self {
+            account: account::Network::new(settings_path),
             catalog: None,
             history: None,
             history_updated: Instant::now(),
@@ -81,6 +85,7 @@ impl Network {
         }
     }
     fn poll(&mut self, app: &mut App) {
+        self.account.poll(app);
         if let Some(rx) = &self.catalog {
             match rx.try_recv() {
                 Ok(result) => {
@@ -136,11 +141,13 @@ fn run() -> Result<()> {
     let mut player = Player::new(settings.volume);
     let mut app = App::new(settings);
     let mut media = media::MediaControls::new()?;
-    let mut network = Network::new();
+    let mut network = Network::new(&settings_path);
+    network.account.restore(&mut app);
     network.catalog(&mut app);
     let theme = ui::theme_from_env();
     let mut terminal = ratatui::try_init()?;
     let _guard = TerminalGuard;
+    crossterm::execute!(io::stdout(), event::EnableBracketedPaste)?;
     let mut last_frame = Instant::now();
     let mut last_save = Instant::now();
     let started = Instant::now();
@@ -156,12 +163,6 @@ fn run() -> Result<()> {
         } else {
             None
         };
-        for direction in player.media_commands() {
-            if let Action::Play(urls) = app.skip_station(direction) {
-                player.play(urls);
-                network.history(&mut app);
-            }
-        }
         media.update(&app);
         for key in media.poll() {
             let action = app.key(KeyEvent::new(key, KeyModifiers::NONE));
@@ -189,6 +190,7 @@ fn run() -> Result<()> {
                     }
                     dispatch(action, &mut app, &mut player, &mut network);
                 }
+                Event::Paste(text) => app.account.paste(&text),
                 Event::Resize(_, _) => {
                     terminal.draw(|frame| ui::render(frame, &mut app, &theme))?;
                 }
@@ -218,6 +220,7 @@ fn dispatch(action: Action, app: &mut App, player: &mut Player, network: &mut Ne
             network.catalog(app);
             network.history(app);
         }
+        Action::Account(command) => network.account.command(command, app),
         Action::None | Action::Quit => {}
     }
 }

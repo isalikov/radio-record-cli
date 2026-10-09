@@ -16,13 +16,13 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            archive: radiome-linux-x86_64.tar.gz
+            archive: radio-record-linux-x86_64.tar.gz
           - os: macos-15-intel
             target: x86_64-apple-darwin
-            archive: radiome-macos-x86_64.tar.gz
+            archive: radio-record-macos-x86_64.tar.gz
           - os: macos-14
             target: aarch64-apple-darwin
-            archive: radiome-macos-aarch64.tar.gz
+            archive: radio-record-macos-aarch64.tar.gz
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v6
@@ -41,8 +41,8 @@ jobs:
       - name: Package binary
         run: |
           mkdir -p dist
-          cp target/${{ matrix.target }}/release/radiome dist/radiome
-          tar -czf dist/${{ matrix.archive }} -C dist radiome
+          cp target/${{ matrix.target }}/release/radio-record dist/radio-record
+          tar -czf dist/${{ matrix.archive }} -C dist radio-record
 
       - name: Upload artifact
         uses: actions/upload-artifact@v6

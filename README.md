@@ -1,4 +1,4 @@
-# radiome
+# radio-record
 
 <p align="center">
   <strong>A keyboard-first internet radio player for macOS and Linux.</strong><br>
@@ -6,12 +6,12 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/isalikov/radiome/releases"><img src="https://img.shields.io/github/v/release/isalikov/radiome?style=flat-square&color=ff2bd6" alt="Latest release"></a>
-  <a href="https://github.com/isalikov/radiome/actions/workflows/release.yml"><img src="https://img.shields.io/github/actions/workflow/status/isalikov/radiome/release.yml?style=flat-square&label=release" alt="Release build"></a>
+  <a href="https://github.com/isalikov/radio-record-cli/releases"><img src="https://img.shields.io/github/v/release/isalikov/radio-record-cli?style=flat-square&color=ff2bd6" alt="Latest release"></a>
+  <a href="https://github.com/isalikov/radio-record-cli/actions/workflows/release.yml"><img src="https://img.shields.io/github/actions/workflow/status/isalikov/radio-record-cli/release.yml?style=flat-square&label=release" alt="Release build"></a>
 </p>
 
 <p align="center">
-  <img src="assets/player-preview.png" alt="radiome player preview">
+  <img src="assets/player-preview.png" alt="radio-record player preview">
 </p>
 
 <p align="center">
@@ -33,12 +33,8 @@ Debian/Ubuntu). Release binaries need only the ALSA runtime library
 (`libasound.so.2`); macOS uses the built-in CoreAudio framework. HTTP, TLS,
 and AAC decoding are compiled into the binary.
 
-The default engine is `auto`: native plays direct AAC-LC and the AAC-LC
-variant of HLS. Engine selection runs again for each station. HE-AAC-only
-stations use mpv; if native exhausts its streams or the output device fails,
-radiome tries mpv once with the station's full stream list, keeping volume
-and pause. If mpv is unavailable, the error retains the native failure.
-`RADIOME_ENGINE=native|mpv` forces an engine and disables automatic switching.
+Audio uses the built-in engine: direct AAC-LC streams and the AAC-LC variant
+of HLS. HE-AAC-only stations are unsupported and report a clear error.
 
 The Rust toolchain is pinned in `mise.toml`. With [mise](https://mise.jdx.dev) installed,
 `mise install` in this directory fetches the right `cargo`, `rustfmt`, and `clippy`.
@@ -52,7 +48,7 @@ make run
 Plain `make` prints help. Minimum terminal size: 44 × 12. History is hidden in
 short windows to leave room for stations. Truecolor terminals show the full palette.
 
-`RADIOME_THEME` selects a color theme: `default` (cyan and magenta on dark),
+`RADIO_RECORD_THEME` selects a color theme: `default` (cyan and magenta on dark),
 `amber` (monochrome amber CRT), `phosphor` (green terminal), or `paper`
 (light, for white terminals). An unknown name falls back to `default` with a
 note on stderr. `NO_COLOR` disables colors and takes precedence over the theme.
@@ -62,7 +58,7 @@ note on stderr. `NO_COLOR` disables colors and takes precedence over the theme.
 Once release archives are published, users can install with one command:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/isalikov/radiome/master/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/isalikov/radio-record-cli/master/scripts/install.sh | sh
 ```
 
 The script downloads the latest GitHub Release for the current macOS or Linux
@@ -70,39 +66,33 @@ architecture. If no release archive exists yet, it falls back to `cargo install`
 from this repository, so the same command also works for local development
 machines that already have Rust installed.
 
-Installed binaries go to `~/.local/bin/radiome` by default. If that directory is
+Installed binaries go to `~/.local/bin/radio-record` by default. If that directory is
 not in `PATH`, add it once in your shell profile.
 
 The binary uses CoreAudio on macOS and the ALSA runtime library on Linux.
-HTTP, TLS, and AAC decoding are built in. The installer prints an optional
-hint for installing mpv, which covers HE-AAC streams and native-engine failures.
+HTTP, TLS, and AAC decoding are built in.
 
 ### Troubleshooting
 
 **`audio device failed · Enter to retry`** — the native output stream reported
 a fatal error. Press Enter to reopen it. Brief device underruns/overruns,
 automatic audio-route changes, and denied real-time scheduling do not stop
-playback or trigger mpv fallback; a brief audio glitch may still be audible.
-In `auto` mode, a fatal error also tries mpv once. If mpv is absent, the
-message includes `mpv fallback unavailable`.
+playback; a brief audio glitch may still be audible.
 
-**`Could not start mpv: No such file or directory`** — mpv is not installed.
-mpv is needed for HE-AAC streams (the 128k and 64k fallbacks), when forced
-with `RADIOME_ENGINE=mpv`, or after a native-engine failure in `auto` mode.
-Install mpv (`brew install mpv` on macOS, `apt install mpv` on Debian/Ubuntu)
-to cover those, or pick another station.
+**`audio device error: ... Sample rate update timed out`** — CoreAudio could
+not finish opening the output while the device format was changing. Press
+Enter to retry. radio-record opens the current hardware rate, including lower-rate
+Bluetooth call formats such as 24 kHz, and resamples radio audio to it. Mono
+output mixes both channels. On macOS the hardware clock is read separately
+from the virtual stream format, so a call's lower rate is preserved. Bluetooth
+headphones can sound less clear while their microphone is active.
 
-**`mpv did not open its IPC socket in 20s`** — only shown by the optional mpv
-engine (`RADIOME_ENGINE=mpv`, an HE-AAC-only station, or native failure in `auto`).
-mpv started but did not respond in time. On macOS this happens on the very
-first launch of a freshly installed mpv, while the system verifies its
-libraries. Press Enter to retry; the second start is fast. Running
-`mpv --version` once from the terminal after installing has the same effect.
-If it keeps happening, check that `/tmp` is writable, since the IPC socket
-lives in a temporary directory there.
+**`HE-AAC streams are unsupported · select another station`** — the station
+only offers streams the built-in AAC-LC decoder cannot play. Select a station
+with a direct AAC-LC stream or an AAC-LC HLS variant.
 
 **`<host> unreachable · Enter to retry`** — the player could not open any of
-the station's streams. radiome falls back from the direct streams to HLS and
+the station's streams. radio-record falls back from the direct streams to HLS and
 then retries the whole list two more times, 2 seconds apart, before showing
 this; the message names the hosts that failed. The HLS host is a rotating DNS
 pool, so a retry can land on an address that works. A VPN or split-tunnel rule
@@ -114,27 +104,27 @@ are shown as `Stream unavailable: <reason>`.
 ## Uninstall
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/isalikov/radiome/master/scripts/uninstall.sh | sh
+curl -fsSL https://raw.githubusercontent.com/isalikov/radio-record-cli/master/scripts/uninstall.sh | sh
 ```
 
-This removes `~/.local/bin/radiome` (or `$RADIOME_PREFIX/bin/radiome` if you installed
+This removes `~/.local/bin/radio-record` (or `$RADIO_RECORD_PREFIX/bin/radio-record` if you installed
 with a custom prefix) and keeps your favorites and volume. To delete the settings too,
-pass `--purge` when running the script directly, or set `RADIOME_PURGE=1` when piping
+pass `--purge` when running the script directly, or set `RADIO_RECORD_PURGE=1` when piping
 it from curl:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/isalikov/radiome/master/scripts/uninstall.sh | RADIOME_PURGE=1 sh
+curl -fsSL https://raw.githubusercontent.com/isalikov/radio-record-cli/master/scripts/uninstall.sh | RADIO_RECORD_PURGE=1 sh
 ```
 
-Settings live in `~/.config/radiome` by default; the script honours the same
-`RADIOME_CONFIG_DIR` and `XDG_CONFIG_HOME` overrides as the app.
+Settings live in `~/.config/radio-record` by default; the script honours the same
+`RADIO_RECORD_CONFIG_DIR` and `XDG_CONFIG_HOME` overrides as the app.
 
 ## Support
 
-If radiome is useful to you, you can support its development on Ko-fi:
+If radio-record is useful to you, you can support its development on Ko-fi:
 
 <p align="center">
-  <a href="https://ko-fi.com/isalikov"><img src="https://ko-fi.com/img/githubbutton_sm.svg" alt="Support radiome on Ko-fi"></a>
+  <a href="https://ko-fi.com/isalikov"><img src="https://ko-fi.com/img/githubbutton_sm.svg" alt="Support radio-record on Ko-fi"></a>
 </p>
 
 Bug reports, station suggestions, and small improvements are welcome too.
@@ -148,10 +138,11 @@ Bug reports, station suggestions, and small improvements are welcome too.
 | Enter | Play selected station |
 | F7 / F9 | Play previous / next station in the current category |
 | F8 / Space | Play / pause |
-| - / = | Player volume, 5% steps, 0–100% |
+| - / = | Player volume, 2% steps, 0–100% |
 | f | Toggle favorite |
 | i | Show / hide recent tracks |
 | d | Toggle diagnostics overlay |
+| a | Open account, sign in, sync favorites, or sign out |
 | PgUp / PgDn, Home / End | Scroll stations |
 | r | Refresh stations and history |
 | s | Stop |
@@ -168,27 +159,70 @@ the category itself identifies them, so the marker is hidden. Station and track
 names retain their original spelling from the API; application labels are English.
 
 Terminal F7/F8/F9 and forwarded media-key events are supported in every
-engine. On macOS, radiome registers system previous/play-pause/next controls
-for both native and mpv playback. The hardware media keys work while radiome
+engine. On macOS, radio-record registers system previous/play-pause/next controls
+during playback. The hardware media keys work while radio-record
 owns the active media session, including when its terminal is unfocused.
 The session shows the station name and playback state and is cleared on
 stop, playback failure, or exit. Fn+F7/F8/F9 sends ordinary function keys to
 the terminal. No global keyboard interception is installed.
 
+## Account and favorites sync
+
+Press `a` to open your Radio Record account. Enter your email and password,
+use Tab to move between fields, then Enter to sign in. Pasting is supported;
+the password is masked and never saved. Esc closes the window and clears the
+password. F7/F8/F9 and media keys still control playback while it is open.
+
+The account window shows your name, email, Premium status, and sync status.
+`s` (or Enter) syncs favorites now; `l` signs out after confirmation and lets
+you switch accounts. Signing out keeps local favorites. Editing personal
+information, registration, and password recovery remain on the Radio Record
+website.
+
+Favorites sync in the background on startup, 750 ms after local changes settle,
+and every 30 seconds while signed in. Changes on only one side apply
+automatically. On first sign-in when the lists differ, or when both sides have
+changed since the last successful sync, a dialog offers three choices:
+
+- **Merge both** preserves independent additions. With a previous sync baseline,
+  it also honors deletions from either side; on first sign-in it keeps the union.
+- **Use local on both** replaces server favorites with the local list.
+- **Use server on both** replaces local favorites with the server list.
+
+Use arrows or Tab to select, or 1/2/3, then Enter to apply. The dialog previews
+station counts and additions/removals on each side. Esc defers the decision;
+`a` reopens it. No replacement happens until you choose. A new server change
+while reviewing causes the lists to be checked again before writing. Local
+edits made during a request are kept for the next sync.
+
+Only favorite **stations** are synced; favorite tracks and podcasts are untouched.
+Network failures leave local favorites and the last successful baseline intact.
+The sidebar shows `a <email>` while signed in and `a Account` otherwise.
+A trailing `!` marks account issues; open the window to see the error and retry
+with `s`. Offline playback and local favorites remain available.
+
+The device session and per-account sync baseline are stored in `account.json`
+next to `settings.json`, with owner-only permissions on Unix. Signing out removes
+that file. Cookies and passwords are not stored. `RADIO_RECORD_CONFIG_DIR` and
+`XDG_CONFIG_HOME` apply to both files.
+
 ## Audio and settings
 
 Native audio uses HTTP (rustls), a pure-Rust AAC-LC decoder (Symphonia),
-and a fixed-capacity ring feeding CoreAudio or ALSA. The engine
-prefers the device's current sample rate when it is at least the stream's,
-avoiding unnecessary clock changes that can time out on headphones. Faster
-output rates use linear interpolation. Otherwise it chooses the closest
-supported rate at or above the stream's. Slower devices and unsupported
-stereo configurations are refused. In `auto`, a device failure starts the optional mpv fallback.
+and a fixed-capacity ring feeding CoreAudio or ALSA. The engine preserves the
+current output-device format, including sample rates below the radio stream
+and mono headset outputs. On macOS it reads the hardware clock rather than
+assuming the virtual stream format has the same rate. Matching rates pass
+through directly; faster rates use linear interpolation; slower rates use a
+low-pass filter before interpolation to suppress aliasing. Filter coefficients
+are prepared before playback, and the callback allocates nothing. A mono
+device receives the average of both channels. Unsupported device formats
+are reported as audio-device errors.
 
 Native pause silences output on the next callback and discards queued audio,
-including the resampler's look-ahead. The reader keeps draining the radio;
+including the resampler's look-ahead and filter history. The reader keeps draining the radio;
 resume buffers fresh audio. HLS rejoins recent published segments, so its
-normal segment delay still applies. The mpv engine uses mpv's pause/cache behavior.
+normal segment delay still applies.
 
 HLS segments are fed completely as ring space becomes available; they are
 not truncated to the ring's capacity. The output waits for 0.3 seconds of
@@ -212,28 +246,27 @@ the terminal font, not an exact pixel size.
 Press `d` for a diagnostics overlay: player state and generation, codec, sample
 rate, channels, bitrate, the active stream and its fallback round, cache fill
 and underruns, worker health, history age, uptime, and a sparkline of recent
-levels. The built-in engine measures telemetry in-process; the mpv engine
-reports it over its private IPC. While a stream buffers, the status symbol
+levels. The built-in engine measures telemetry in-process. While a stream buffers, the status symbol
 shows the real cache percentage instead of a bare dot. If the player worker
 stops reporting for two seconds while audio should be alive, the footer shows
 `Player engine stalled · q quit`. The warning clears when the worker resumes
 reporting; each new play request starts a fresh two-second deadline.
 
 The UI and application logic use Rust, Ratatui and Crossterm. The built-in
-engine decodes AAC in-process; if mpv is installed it is used as a fallback
-engine (see `RADIOME_ENGINE` above). macOS system media controls belong to
-radiome and remain available across engine changes. Volume is software gain
+engine decodes AAC in-process. macOS system media controls belong to radio-record
+and remain available across station changes. Volume is software gain
 and does not change system volume.
 
-Favorites and volume are saved atomically in `~/.config/radiome/settings.json`.
-Directory precedence: `RADIOME_CONFIG_DIR`, `$XDG_CONFIG_HOME/radiome`,
-`~/.config/radiome`. Corrupt settings are reported rather than overwritten.
+Favorites and volume are saved atomically in `~/.config/radio-record/settings.json`.
+Directory precedence: `RADIO_RECORD_CONFIG_DIR`, `$XDG_CONFIG_HOME/radio-record`,
+`~/.config/radio-record`. Corrupt settings are reported rather than overwritten.
 
 History and current track metadata refresh every 15 seconds. The API may lag
-behind audio, especially after pausing. `RADIOME_BASE_URL` overrides the API
+behind audio, especially after pausing. `RADIO_RECORD_BASE_URL` overrides the API
 base URL for development. Requests time out after 15 seconds.
-Stream priority: `stream_320`, `stream_hls`, `stream_128`, `stream_64`. If a stream
-fails to load, the player tries the next distinct one before reporting an error.
+Stream priority: `stream_320`, then the AAC-LC variant of `stream_hls`. If a
+stream fails to load, the player tries the next distinct supported URL before
+reporting an error. The HE-AAC `stream_128` and `stream_64` entries are skipped.
 
 ## Verify
 
@@ -247,11 +280,11 @@ make test-audio
 `make test` runs offline: stream fixtures recorded from the real streams are
 decoded, and the engine pipeline is tested against a null output sink using
 the same callback as the real device. Tests cover long segments, pause and
-resume, stale buffers, station changes, and engine fallback. Live
+resume, stale buffers, station changes, stream fallback, and filtered downsampling. Live
 checks that need the network run with
 `cargo test live_ -- --ignored` (direct stream, HLS, and a short burst on the
 real audio device). The HLS check observes multiple segment publications
-for continuity. `make test-audio` exercises the optional mpv fallback
-engine with a sine wave and silent output: audio levels, software volume,
-media play/pause bindings, and previous/next delivery over its IPC. It needs
-mpv installed and is skipped in every other respect.
+for continuity. `make test-audio` opens the current real output format with
+silent audio and verifies that its hardware rate and channels remain unchanged.
+Account tests use a local HTTP server for login, merge decisions, write
+verification, and request failures; they need no real account.

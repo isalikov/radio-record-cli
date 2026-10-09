@@ -1,7 +1,6 @@
 # The native audio engine
 
-Implementation notes for native AAC-LC playback, HTTP transport, and the
-optional mpv fallback.
+Implementation notes for built-in AAC-LC playback and HTTP transport.
 
 ## Goal
 
@@ -30,9 +29,8 @@ desktop distribution; no static ALSA link exists upstream, alsa-sys issue
    implemented; alternatives are weeks old). The engine therefore *refuses*
    HE-only stream lists up front rather than playing half-band audio —
    "must refuse, not half-play" is a red line.
-6. mpv applies volume in the audio output, *after* its filter chain, so the
-   astats meter measures pre-gain signal. The native engine reproduces this:
-   RMS is computed on samples consumed by the output callback, before gain.
+6. RMS is computed on samples consumed by the output callback before software
+   gain, so the audio meter follows the signal independently of player volume.
 
 ## Architecture
 
@@ -57,7 +55,6 @@ audio callback (cpal) ← pops samples, applies volume, counts underruns
 - **Native pause**: the next callback silences output and clears queued samples
   and interpolation state. An epoch also catches pause/resume between callbacks.
   The reader drains paused audio; HLS resume rejoins recent published segments.
-  mpv retains its own pause/cache behavior.
 - **Bounded audio**: the ring has 288,000 samples (3 s at 48 kHz stereo).
   The reader holds one decoded HLS segment and feeds it fully with backpressure.
   Playlist bodies are limited to 256 KiB and segment bodies to 4 MiB. Events
@@ -75,15 +72,26 @@ audio callback (cpal) ← pops samples, applies volume, counts underruns
 | Ring | `rtrb` 0.4 | documented wait-free SPSC, no allocation after construction |
 | HLS client | hand-written `engine/hls.rs` | unencrypted ADTS playlists; `url` resolves relative references; metadata is ignored |
 
-## Engine selection
+## Supported streams and output formats
 
-`RADIOME_ENGINE=auto|native|mpv` (default `auto`): selection runs for each
-station. Native is preferred for an LC-playable stream with an output device;
-otherwise mpv is opened. In auto mode, native stream exhaustion or device
-failure drops native and tries mpv once with the full stream list, current
-volume, and pause. Missing mpv preserves the native error. Explicit native
-or mpv overrides disable automatic engine switching. Native filters the
-known HE stream kinds and picks only the LC variant from an HLS master.
+The player always opens the built-in engine. It filters known HE-AAC stream
+kinds and picks the AAC-LC variant from an HLS master. An HE-AAC-only list
+fails up front; URL fallback stays within the supported AAC-LC streams.
+
+Opening output preserves the device's current mono/stereo format. On macOS,
+a read-only CoreAudio property query obtains the nominal hardware sample rate
+separately from CPAL's virtual stream format. This matters while a Bluetooth
+microphone is active: AirPods can use a 24 kHz clock while a music stream uses
+44.1 kHz. The player converts audio to the hardware clock rather than trying
+to raise it. Alternative supported configurations are queried only if the
+current format cannot be used.
+
+Matching rates pass through unchanged. Upsampling uses linear interpolation.
+Downsampling first applies a 64-tap Blackman-windowed sinc low-pass filter,
+with cutoff at 90% of output Nyquist, then interpolates. Coefficients are built
+before the stream starts; the callback owns fixed arrays for sample history
+and performs no allocation or trigonometry. Mono output averages the two
+resampled channels. Pause resets filter history and interpolation state.
 
 ## Verification
 
@@ -91,42 +99,35 @@ known HE stream kinds and picks only the LC variant from an HLS master.
   (`tests/fixtures/`), including an HE-AAC sample demonstrating the unsupported low-rate core and
   real HLS playlists/segments. Output tests use the production callback and
   verify complete segment transfer, pause silence, buffer reset, starvation,
-  and engine switching. A throttled reader paces direct fixtures like network.
+  station replacement, and anti-alias filtering. A throttled reader paces
+  direct fixtures like network.
 - `#[ignore]` live tests (network + device): direct stream, HLS stream, and
-  a short burst on the real output device — the native equivalent of
-  `make test-audio`, runnable without mpv. The HLS test observes 18 s after
-  startup to cover multiple publications without underruns.
+  a short burst on the real output device. `make test-audio` checks device
+  opening separately with silence and verifies the hardware rate is unchanged.
+  The HLS test observes 18 s after startup to cover multiple publications without underruns.
 - Format limitation: native selection trusts Record's `stream_320` as LC
   and HLS `CODECS` declarations. Symphonia can decode only the low-rate core
   of implicit HE-AAC; the fixture test demonstrates this, not codec rejection.
-  If upstream relabels HE-AAC as LC, use `RADIOME_ENGINE=mpv`.
+  Incorrect codec declarations upstream require a decoder-capability check.
 
 ## Roadmap beyond this implementation
 
 1. **HLS `X-DATERANGE` metadata** (X-ARTIST/X-TITLE) as a faster track source
    than the 15 s API poll — additive, after the engine soaks.
 2. **Linux system media controls**: add MPRIS integration. macOS already
-   uses an application-owned MPRemoteCommandCenter session for both engines,
+   uses an application-owned MPRemoteCommandCenter session for playback,
    with Cocoa events pumped on the main thread alongside the terminal loop.
    Terminal F7/F8/F9 remain available on both platforms.
 3. **libfdk-aac** (vendored C via `symphonia-adapter-fdk-aac`) behind a
    feature flag to cover the HE-AAC tail (dead 96k mount + dead HLS host
-   simultaneously) and eventually drop mpv entirely. Gated on the radiome
+   simultaneously). Gated on the radio-record
    license being compatible with FDK's Software IP Royalty-Free License.
-4. ~~Resampling only if a device cannot be opened at the stream's rate~~ —
-   shipped 2026-10-09: linear interpolation in the output callback (upsampling
-   only; slower devices are refused). Stereo output devices that
-   expose only 48 kHz can play 44.1 kHz streams. A `rubato` upgrade can
-   later replace the interpolator if its imaging is ever measured to matter.
-
 ## Sources
 
 - Stream formats measured with ffprobe on live samples, 2026-10-08.
 - Symphonia codec status: https://github.com/pdeljanov/Symphonia
 - cpal 0.18 CoreAudio host (hot-plug, default-device monitor):
   https://github.com/RustAudio/cpal
-- mpv volume vs filters: mpv `DOCS/man/options.rst` (`--volume`),
-  `audio/out/ao.c` (`ao_set_gain`)
 - ureq timeouts: https://docs.rs/ureq (v3 `Timeouts`, v2 `timeout_read`)
 - rtrb: https://docs.rs/rtrb
 - alsa-sys static link status: https://github.com/diwic/alsa-sys/issues/10
