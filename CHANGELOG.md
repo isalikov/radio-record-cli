@@ -2,6 +2,15 @@
 
 All notable changes to this project are documented here.
 
+## [Unreleased]
+
+### Fixed
+
+- Prefer the current output-device sample rate when it supports native playback,
+  avoiding unnecessary CoreAudio clock changes and headphone rate-update timeouts.
+- Clear the stalled-worker warning after reporting resumes and start a fresh
+  heartbeat deadline on each play request.
+
 ## [v2.0.1] - 2026-10-09
 
 ### Fixed

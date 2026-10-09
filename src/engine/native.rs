@@ -521,8 +521,18 @@ fn pop_frame(consumer: &mut Consumer<f32>) -> Option<[f32; 2]> {
 
 /// The device rate to open for a stream of `rate` Hz: the stream rate when
 /// the device supports it, else the closest supported rate that is not below
-/// it. `None` means every config is slower than the stream.
-fn device_rate(min: u32, max: u32, rate: u32) -> Option<u32> {
+/// it. Prefer the current device rate when it supports upsampling or pass-through.
+/// `None` means every config is slower than the stream.
+fn device_rate(min: u32, max: u32, rate: u32, current: Option<u32>) -> Option<u32> {
+    // Keeping the device clock avoids a CoreAudio rate-change handshake, which
+    // can time out on headphones even when the advertised range includes rate.
+    if let Some(current) = current
+        && current >= rate
+        && min <= current
+        && current <= max
+    {
+        return Some(current);
+    }
     if min <= rate && rate <= max {
         Some(rate)
     } else if rate < min {
@@ -586,8 +596,12 @@ pub(crate) fn cpal_sink(
     let configs = device
         .supported_output_configs()
         .map_err(|err| Error::new(format!("audio device query failed: {err}")))?;
-    // Prefer the device rate closest to the stream that is not below it:
-    // in-range is a pass-through, anything faster is resampled up.
+    let current_rate = device
+        .default_output_config()
+        .ok()
+        .map(|config| config.sample_rate());
+    // Preserve the device clock whenever possible; otherwise choose the closest
+    // supported rate not below the stream. Faster output is resampled up.
     let supported = configs
         .into_iter()
         .filter(|config| {
@@ -598,10 +612,15 @@ pub(crate) fn cpal_sink(
                 )
         })
         .filter_map(|config| {
-            device_rate(config.min_sample_rate(), config.max_sample_rate(), rate)
-                .map(|open_rate| (config, open_rate))
+            device_rate(
+                config.min_sample_rate(),
+                config.max_sample_rate(),
+                rate,
+                current_rate,
+            )
+            .map(|open_rate| (config, open_rate))
         })
-        .min_by_key(|&(_, open_rate)| open_rate)
+        .min_by_key(|&(_, open_rate)| (Some(open_rate) != current_rate, open_rate))
         .ok_or_else(|| {
             Error::new(format!(
                 "the audio device does not support {rate} Hz stereo"
@@ -1270,6 +1289,28 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn output_rate_preserves_device_clock_when_resampling_is_supported() {
+        assert_eq!(
+            device_rate(44_100, 96_000, 44_100, Some(48_000)),
+            Some(48_000)
+        );
+        assert_eq!(
+            device_rate(44_100, 96_000, 48_000, Some(48_000)),
+            Some(48_000)
+        );
+        // A slower or out-of-range clock cannot be used by our upsampler.
+        assert_eq!(
+            device_rate(44_100, 96_000, 48_000, Some(44_100)),
+            Some(48_000)
+        );
+        assert_eq!(
+            device_rate(44_100, 48_000, 44_100, Some(96_000)),
+            Some(44_100)
+        );
+        assert_eq!(device_rate(44_100, 48_000, 96_000, Some(48_000)), None);
+    }
+
+    #[test]
     fn resample_passes_frames_through_at_matching_rates() {
         let (mut producer, mut consumer) = RingBuffer::new(64);
         // Matching rates need no look-ahead: every input frame must emerge.
@@ -1312,10 +1353,10 @@ pub(crate) mod tests {
 
     #[test]
     fn device_rate_prefers_the_stream_and_refuses_slower_devices() {
-        assert_eq!(device_rate(44_100, 48_000, 44_100), Some(44_100));
-        assert_eq!(device_rate(48_000, 48_000, 44_100), Some(48_000));
-        assert_eq!(device_rate(48_000, 96_000, 44_100), Some(48_000));
-        assert_eq!(device_rate(24_000, 24_000, 44_100), None);
+        assert_eq!(device_rate(44_100, 48_000, 44_100, None), Some(44_100));
+        assert_eq!(device_rate(48_000, 48_000, 44_100, None), Some(48_000));
+        assert_eq!(device_rate(48_000, 96_000, 44_100, None), Some(48_000));
+        assert_eq!(device_rate(24_000, 24_000, 44_100, None), None);
     }
 
     fn reader_shared(output: Arc<OutputState>) -> ReaderShared {

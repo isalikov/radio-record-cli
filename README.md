@@ -178,10 +178,12 @@ the terminal. No global keyboard interception is installed.
 ## Audio and settings
 
 Native audio uses HTTP (rustls), a pure-Rust AAC-LC decoder (Symphonia),
-and a fixed-capacity ring feeding CoreAudio or ALSA. The output callback
-resamples up with linear interpolation when the device offers only rates
-above the stream's. Slower devices and unsupported stereo configurations
-are refused. In `auto`, a device failure starts the optional mpv fallback.
+and a fixed-capacity ring feeding CoreAudio or ALSA. The engine
+prefers the device's current sample rate when it is at least the stream's,
+avoiding unnecessary clock changes that can time out on headphones. Faster
+output rates use linear interpolation. Otherwise it chooses the closest
+supported rate at or above the stream's. Slower devices and unsupported
+stereo configurations are refused. In `auto`, a device failure starts the optional mpv fallback.
 
 Native pause silences output on the next callback and discards queued audio,
 including the resampler's look-ahead. The reader keeps draining the radio;
@@ -214,7 +216,8 @@ levels. The built-in engine measures telemetry in-process; the mpv engine
 reports it over its private IPC. While a stream buffers, the status symbol
 shows the real cache percentage instead of a bare dot. If the player worker
 stops reporting for two seconds while audio should be alive, the footer shows
-`Player engine stalled · q quit`.
+`Player engine stalled · q quit`. The warning clears when the worker resumes
+reporting; each new play request starts a fresh two-second deadline.
 
 The UI and application logic use Rust, Ratatui and Crossterm. The built-in
 engine decodes AAC in-process; if mpv is installed it is used as a fallback

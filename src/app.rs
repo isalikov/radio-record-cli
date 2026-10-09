@@ -101,6 +101,16 @@ impl App {
         }
     }
 
+    pub fn set_worker_stalled(&mut self, stalled: bool) {
+        const MESSAGE: &str = "Player engine stalled · q quit";
+        self.worker_stalled = stalled;
+        if stalled {
+            self.error = Some(MESSAGE.into());
+        } else if self.error.as_deref() == Some(MESSAGE) {
+            self.error = None;
+        }
+    }
+
     pub fn set_catalog(&mut self, catalog: Catalog) {
         let previous = self.current_category().clone();
         self.categories = vec![Category::All, Category::Favorites];
@@ -453,6 +463,20 @@ pub mod tests {
     }
     pub fn press(app: &mut App, code: KeyCode) -> Action {
         app.key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    #[test]
+    fn recovered_worker_clears_stall_message_without_clearing_other_errors() {
+        let mut app = fixture();
+        app.set_worker_stalled(true);
+        assert!(app.worker_stalled);
+        assert_eq!(app.error.as_deref(), Some("Player engine stalled · q quit"));
+        app.set_worker_stalled(false);
+        assert!(!app.worker_stalled);
+        assert!(app.error.is_none());
+        app.error = Some("catalog unavailable".into());
+        app.set_worker_stalled(false);
+        assert_eq!(app.error.as_deref(), Some("catalog unavailable"));
     }
 
     #[test]

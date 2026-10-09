@@ -149,10 +149,7 @@ fn run() -> Result<()> {
         player.update();
         app.playback = player.snapshot.clone();
         app.generation = player.generation();
-        app.worker_stalled = player.worker_stalled();
-        if app.worker_stalled {
-            app.error = Some("Player engine stalled · q quit".into());
-        }
+        app.set_worker_stalled(player.worker_stalled());
         app.uptime = started.elapsed();
         app.history_age = if app.now.is_some() {
             Some(network.history_updated.elapsed())

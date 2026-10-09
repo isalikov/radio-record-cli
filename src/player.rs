@@ -82,6 +82,7 @@ impl Player {
     // `streams` is in priority order; later entries are tried when earlier ones fail to load.
     pub fn play(&mut self, streams: Vec<Stream>) {
         self.generation += 1;
+        self.last_update = Instant::now();
         self.snapshot = Snapshot {
             state: PlayerState::Buffering,
             ..Snapshot::default()
@@ -419,6 +420,15 @@ pub(crate) mod tests {
             .unwrap();
         player.update();
         assert_eq!(player.snapshot.state, PlayerState::Buffering);
+    }
+
+    #[test]
+    fn starting_playback_gets_a_fresh_worker_heartbeat_deadline() {
+        let (mut player, _updates) = player_without_worker();
+        player.last_update -= WORKER_STALL_AFTER + Duration::from_secs(1);
+        player.play(vec![test_stream("https://example.com/audio")]);
+        assert_eq!(player.snapshot.state, PlayerState::Buffering);
+        assert!(!player.worker_stalled());
     }
 
     #[test]
