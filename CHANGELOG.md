@@ -2,6 +2,21 @@
 
 All notable changes to this project are documented here.
 
+## [v3.2.0] - 2026-10-11
+
+### Added
+
+- Liked songs: `l` saves or removes the song on air, with a `♥ SAVED TO VAULT`
+  toast in the now-playing border, a `♥` before liked titles, and a liked-song
+  count in the header. Songs are stored locally in `settings.json`.
+- Track vault on `v`: liked songs in place of the station browser, with
+  station and save time, filter (`/`), sort (`o`), and confirmed delete (`x`).
+- Link card on Enter: YouTube Music, Spotify, Yandex Music, and Apple Music
+  links plus the radiorecord.ru track page; open one (Enter or `1`–`5`), open
+  all (`a`), or copy through OSC 52 (`c`). Apple Music and the track page come
+  from the API; Yandex Music is upgraded to a direct link by a background
+  lookup when artist and title match.
+
 ## [v3.1.0] - 2026-10-11
 
 ### Added

@@ -4,6 +4,7 @@ use crate::{
     cover::Cover,
     fx,
     player::{PlayerState, STREAM_ROUNDS},
+    songs::Service,
 };
 use ratatui::{
     Frame,
@@ -39,6 +40,9 @@ pub struct Theme {
     band: Color,
     warn: Color,
     glow: Color,
+    /// Streaming services in their own neon colors; other palettes keep
+    /// to their own hues.
+    brands: bool,
 }
 
 impl Default for Theme {
@@ -55,6 +59,7 @@ impl Default for Theme {
             band: Color::Rgb(19, 17, 31),
             warn: Color::Rgb(252, 238, 10),
             glow: Color::Rgb(11, 58, 68),
+            brands: true,
         }
     }
 }
@@ -74,6 +79,7 @@ impl Theme {
             band: Color::Rgb(48, 28, 0),
             warn: Color::Rgb(255, 241, 194),
             glow: Color::Rgb(58, 36, 0),
+            brands: false,
         }
     }
 
@@ -91,6 +97,7 @@ impl Theme {
             band: Color::Rgb(6, 34, 14),
             warn: Color::Rgb(232, 255, 176),
             glow: Color::Rgb(10, 58, 24),
+            brands: false,
         }
     }
 
@@ -108,6 +115,7 @@ impl Theme {
             band: Color::Rgb(234, 231, 220),
             warn: Color::Rgb(154, 107, 0),
             glow: Color::Rgb(217, 240, 242),
+            brands: false,
         }
     }
 
@@ -125,12 +133,28 @@ impl Theme {
             band: Color::Reset,
             warn: Color::Reset,
             glow: Color::Reset,
+            brands: false,
         }
     }
 
     /// False for the `NO_COLOR` palette, where pictures cannot be drawn.
     fn colorful(&self) -> bool {
         self.bg != Color::Reset
+    }
+
+    /// The accent of one streaming service in the link card.
+    fn service(&self, service: Service) -> Color {
+        match (self.brands, service) {
+            (true, Service::YouTube) => Color::Rgb(255, 0, 51),
+            (true, Service::Spotify) => Color::Rgb(30, 215, 96),
+            (true, Service::Yandex) => Color::Rgb(255, 204, 0),
+            (true, Service::Apple) => Color::Rgb(250, 87, 193),
+            (false, Service::YouTube) => self.alert,
+            (false, Service::Spotify) => self.accent,
+            (false, Service::Yandex) => self.warn,
+            (false, Service::Apple) => self.wave,
+            (_, Service::Record) => self.alert,
+        }
     }
 
     /// The neon gradient at `t` in 0..1: accent, then wave, then alert.
@@ -290,8 +314,11 @@ pub fn render(frame: &mut Frame, app: &mut App, theme: &Theme, graphics: &mut Gr
     let category_width = if area.width >= 90 { 25 } else { 18 };
     let [sidebar, right] =
         Layout::horizontal([Constraint::Length(category_width), Constraint::Min(1)]).areas(body);
-    categories(frame, app, sidebar, theme);
-    if app.show_history && body.height >= 12 {
+    if app.vault.open {
+        // The vault takes the whole body; header and now playing stay.
+        vault(frame, app, body, theme);
+    } else if app.show_history && body.height >= 12 {
+        categories(frame, app, sidebar, theme);
         let [stations_area, history_area] = Layout::vertical([
             Constraint::Min(6),
             Constraint::Length((body.height / 3).clamp(5, 8)),
@@ -300,11 +327,15 @@ pub fn render(frame: &mut Frame, app: &mut App, theme: &Theme, graphics: &mut Gr
         stations(frame, app, stations_area, theme);
         history(frame, app, history_area, theme);
     } else {
+        categories(frame, app, sidebar, theme);
         stations(frame, app, right, theme);
     }
     match panel {
         Some(panel) => now_playing(frame, app, footer, panel, theme, graphics),
         None => playback(frame, app, footer.inner(Margin::new(1, 0)), theme),
+    }
+    if app.vault.open && app.vault.detail.is_some() {
+        link_card(frame, area, app, theme);
     }
     if app.help {
         help(frame, area, app.help_scroll, theme);
@@ -365,6 +396,12 @@ fn header(frame: &mut Frame, app: &App, area: Rect, theme: &Theme) {
         dot(),
         Span::styled(
             format!("{} FAV", app.settings.favorites.len()),
+            Style::default().fg(theme.muted),
+        ),
+        dot(),
+        Span::styled("♥ ", Style::default().fg(theme.alert)),
+        Span::styled(
+            app.settings.songs.len().to_string(),
             Style::default().fg(theme.muted),
         ),
         dot(),
@@ -611,7 +648,8 @@ fn playback(frame: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     let track = if let Some(error) = &app.playback.error {
         error.clone()
     } else if let Some(track) = app.history.first() {
-        format!("{} — {}", track.artist, track.song)
+        let heart = if app.on_air_liked() { "♥ " } else { "" };
+        format!("{heart}{} — {}", track.artist, track.song)
     } else if app.history_loading {
         "Loading track…".into()
     } else {
@@ -625,9 +663,15 @@ fn playback(frame: &mut Frame, app: &App, area: Rect, theme: &Theme) {
         })),
         Rect::new(area.x, area.y + 1, area.width, 1),
     );
-    let status = app.error.as_deref().unwrap_or("");
+    let status = match app.active_toast() {
+        Some(_) => Line::from(toast_spans(app, theme)),
+        None => Line::styled(
+            app.error.as_deref().unwrap_or("").to_owned(),
+            Style::default().fg(theme.alert),
+        ),
+    };
     frame.render_widget(
-        Paragraph::new(status).style(Style::default().fg(theme.alert)),
+        Paragraph::new(status),
         Rect::new(area.x, area.y + 2, area.width, 1),
     );
 }
@@ -854,7 +898,13 @@ fn now_playing(
         .border_type(BorderType::Thick)
         .border_style(Style::default().fg(glow))
         .title(Line::from(top))
-        .title(notch(volume_meter(app.settings.volume, theme), theme))
+        .title(notch(
+            match app.active_toast() {
+                Some(_) => toast_spans(app, theme),
+                None => volume_meter(app.settings.volume, theme),
+            },
+            theme,
+        ))
         .title_bottom(Line::from(bottom));
     let signal = signal(app, theme);
     if !signal.is_empty() {
@@ -869,7 +919,7 @@ fn now_playing(
         Rect::new(inner.x + 1, inner.y, panel.cover_rows * 2, panel.cover_rows).intersection(inner);
     // Terminal pictures sit above the text layer, so popups would not cover
     // them: any open overlay switches back to half-blocks, which it can cover.
-    let overlay = app.help || app.show_diag || app.account.open;
+    let overlay = app.help || app.show_diag || app.account.open || app.vault.detail.is_some();
     let sharp = match &app.cover {
         Some(art) if theme.colorful() && !overlay => graphics.draw(frame, art, cover),
         _ => false,
@@ -1063,13 +1113,18 @@ fn details(app: &App, width: u16, panel: Panel, theme: &Theme) -> Vec<Line<'stat
         .and_then(|(since, seed)| {
             fx::progress(app.uptime, since, fx::REVEAL).map(|progress| (progress, seed))
         });
-    let title = match reveal {
+    let mut title = match reveal {
         Some((progress, seed)) => Line::from(vec![
             Span::styled(fx::scramble(&title, progress, seed), bold),
             Span::styled("█", Style::default().fg(theme.accent)),
         ]),
         None => Line::styled(title, bold),
     };
+    if app.on_air_liked() {
+        title
+            .spans
+            .insert(0, Span::styled("♥ ", Style::default().fg(theme.alert)));
+    }
     let mut lines = vec![
         title,
         Line::styled(artist, Style::default().fg(theme.muted)),
@@ -1349,6 +1404,339 @@ impl Widget for Visualizer<'_> {
     }
 }
 
+/// `♥ SAVED TO VAULT`: decodes in once with full motion, still otherwise.
+fn toast_spans(app: &App, theme: &Theme) -> Vec<Span<'static>> {
+    let Some(toast) = app.active_toast() else {
+        return Vec::new();
+    };
+    let text = match fx::progress(app.uptime, toast.since, fx::REVEAL) {
+        Some(progress) if app.fx.decorative() => {
+            fx::scramble(&toast.text, progress, toast.since.as_millis() as u64)
+        }
+        _ => toast.text.clone(),
+    };
+    let color = if toast.good { theme.alert } else { theme.warn };
+    vec![Span::styled(
+        text,
+        Style::default().fg(color).add_modifier(Modifier::BOLD),
+    )]
+}
+
+/// How long ago a song was saved: `now`, `5m ago`, `3h ago`, `2d ago`, or
+/// the UTC date for older ones.
+fn saved_text(clock: i64, saved: i64) -> String {
+    let age = clock - saved;
+    match age {
+        _ if saved <= 0 => "—".to_owned(),
+        ..60 => "now".to_owned(),
+        60..3600 => format!("{}m ago", age / 60),
+        3600..86_400 => format!("{}h ago", age / 3600),
+        86_400..604_800 => format!("{}d ago", age / 86_400),
+        _ => {
+            // Civil date from days since 1970-01-01 (Howard Hinnant).
+            let days = saved.div_euclid(86_400) + 719_468;
+            let era = days.div_euclid(146_097);
+            let doe = days - era * 146_097;
+            let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+            let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+            let mp = (5 * doy + 2) / 153;
+            let day = doy - (153 * mp + 2) / 5 + 1;
+            let month = if mp < 10 { mp + 3 } else { mp - 9 };
+            let year = yoe + era * 400 + i64::from(month <= 2);
+            format!("{year:04}-{month:02}-{day:02}")
+        }
+    }
+}
+
+/// `text` cut or padded to exactly `width` columns, with `…` when cut.
+fn fit(text: &str, width: usize) -> String {
+    let mut out = String::new();
+    let mut used = 0;
+    let total = Span::raw(text).width();
+    for character in text.chars() {
+        let size = Span::raw(character.to_string()).width();
+        let reserve = usize::from(total > width);
+        if used + size + reserve > width {
+            if total > width && used < width {
+                out.push('…');
+                used += 1;
+            }
+            break;
+        }
+        out.push(character);
+        used += size;
+    }
+    out.push_str(&" ".repeat(width.saturating_sub(used)));
+    out
+}
+
+/// The track vault: every liked song, filtered and sorted, in place of the
+/// station browser.
+fn vault(frame: &mut Frame, app: &mut App, area: Rect, theme: &Theme) {
+    let songs = app.vault_songs();
+    let total = app.settings.songs.len();
+    let count = format!(
+        "{:02}/{:02}",
+        app.vault.list.selected().map_or(0, |index| index + 1),
+        songs.len()
+    );
+    let key = |text: &str| Span::styled(text.to_owned(), Style::default().fg(theme.accent));
+    let muted = |text: &str| Span::styled(text.to_owned(), Style::default().fg(theme.muted));
+    let dot = || Span::styled(" ▪ ", Style::default().fg(theme.edge));
+    let mut hints = vec![Span::styled("━ ", Style::default().fg(theme.edge))];
+    if app.vault.filtering {
+        hints.extend([
+            key("/"),
+            Span::styled(app.vault.filter.clone(), Style::default().fg(theme.fg)),
+            Span::styled("█", Style::default().fg(theme.accent)),
+            dot(),
+            key("Enter "),
+            muted("keep"),
+            dot(),
+            key("Esc "),
+            muted("clear"),
+        ]);
+    } else if app.vault.armed.is_some() {
+        hints.push(Span::styled(
+            "DELETE? x again · Esc cancel",
+            Style::default()
+                .fg(theme.alert)
+                .add_modifier(Modifier::BOLD),
+        ));
+    } else {
+        if !app.vault.filter.is_empty() {
+            hints.extend([
+                key("/"),
+                Span::styled(app.vault.filter.clone(), Style::default().fg(theme.fg)),
+                dot(),
+            ]);
+        }
+        hints.extend([
+            key("Enter "),
+            muted("links"),
+            dot(),
+            key("/ "),
+            muted("filter"),
+        ]);
+        hints.extend([
+            dot(),
+            key("o "),
+            muted("sort"),
+            dot(),
+            key("x "),
+            muted("del"),
+        ]);
+        hints.extend([dot(), key("v "), muted("back")]);
+    }
+    hints.push(Span::raw(" "));
+    let block = hud("TRACK VAULT", theme)
+        .title(notch(
+            vec![
+                muted("SORT "),
+                Span::styled(
+                    format!("{} ▾", app.vault.sort.label()),
+                    Style::default().fg(theme.accent),
+                ),
+                dot(),
+                muted(&count),
+            ],
+            theme,
+        ))
+        .title_bottom(Line::from(hints));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if songs.is_empty() {
+        let text = if total == 0 {
+            "No saved tracks · l to like what's on air"
+        } else {
+            "No matches · Esc clear"
+        };
+        frame.render_widget(
+            Paragraph::new(text).style(Style::default().fg(theme.muted)),
+            inner.inner(Margin::new(1, 0)),
+        );
+        return;
+    }
+    // One column for the highlight symbol, two for the heart.
+    let width = usize::from(inner.width.saturating_sub(3));
+    let wide = width >= 64 && inner.height >= 4;
+    let (station_width, saved_width) = if wide { (20, 11) } else { (0, 0) };
+    let label_width = width.saturating_sub(station_width + saved_width);
+    let mut list_area = inner;
+    if wide {
+        let header = format!(
+            "   {}{}{}",
+            fit("ARTIST — TITLE", label_width),
+            fit("STATION", station_width),
+            fit("SAVED", saved_width)
+        );
+        frame.render_widget(
+            Paragraph::new(header).style(Style::default().fg(theme.muted)),
+            Rect::new(inner.x, inner.y, inner.width, 1),
+        );
+        list_area = Rect::new(inner.x, inner.y + 1, inner.width, inner.height - 1);
+    }
+    let armed = app.vault.armed.as_deref();
+    let items: Vec<_> = songs
+        .iter()
+        .map(|song| {
+            let doomed = armed == Some(song.key().as_str());
+            let mut spans = vec![
+                Span::styled("♥ ", Style::default().fg(theme.alert)),
+                Span::styled(
+                    fit(&song.label(), label_width),
+                    Style::default().fg(if doomed { theme.alert } else { theme.fg }),
+                ),
+            ];
+            if wide {
+                spans.push(Span::styled(
+                    fit(&song.station, station_width.saturating_sub(1)) + " ",
+                    Style::default().fg(theme.muted),
+                ));
+                spans.push(Span::styled(
+                    fit(&saved_text(app.clock, song.saved), saved_width),
+                    Style::default().fg(theme.muted),
+                ));
+            }
+            ListItem::new(Line::from(spans))
+        })
+        .collect();
+    frame.render_stateful_widget(
+        List::new(items)
+            .highlight_style(Style::default().bg(theme.selected))
+            .highlight_symbol("▌"),
+        list_area,
+        &mut app.vault.list,
+    );
+}
+
+/// One song's links to streaming services, over the vault.
+fn link_card(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
+    let Some(song) = app.detail_song() else {
+        return;
+    };
+    let links = song.links();
+    let width = 62.min(area.width.saturating_sub(4));
+    // Borders, three lines of song, gaps around the links, and the URL.
+    let height = (links.len() as u16 + 8).min(area.height);
+    let popup = Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y + (area.height - height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, popup);
+    let key = |text: &str| Span::styled(text.to_owned(), Style::default().fg(theme.accent));
+    let muted = |text: &str| Span::styled(text.to_owned(), Style::default().fg(theme.muted));
+    let dot = || Span::styled(" ▪ ", Style::default().fg(theme.edge));
+    let armed = app.vault.armed.as_deref() == Some(song.key().as_str());
+    let hints = if armed {
+        Line::from(vec![
+            Span::styled("━ ", Style::default().fg(theme.edge)),
+            Span::styled(
+                "DELETE? x again · Esc cancel ",
+                Style::default()
+                    .fg(theme.alert)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled("━ ", Style::default().fg(theme.edge)),
+            key("Enter "),
+            muted("open"),
+            dot(),
+            key("c "),
+            muted("copy"),
+            dot(),
+            key("a "),
+            muted("all"),
+            dot(),
+            key("x "),
+            muted("del"),
+            dot(),
+            key("Esc "),
+            muted("back "),
+        ])
+    };
+    let block = hud("TRACK", theme)
+        .style(Style::default().bg(theme.bg))
+        .title(notch(
+            vec![
+                Span::styled("♥ ", Style::default().fg(theme.alert)),
+                muted(&saved_text(app.clock, song.saved).to_uppercase()),
+            ],
+            theme,
+        ))
+        .title_bottom(hints)
+        .padding(Padding::horizontal(1));
+    let inner = block.inner(popup);
+    let room = usize::from(inner.width);
+    let selected = app.vault.link.min(links.len() - 1);
+    let mut lines = vec![
+        Line::styled(
+            fit(&song.song, room),
+            Style::default().fg(theme.fg).add_modifier(Modifier::BOLD),
+        ),
+        Line::styled(fit(&song.artist, room), Style::default().fg(theme.muted)),
+        Line::styled(
+            fit(
+                &format!(
+                    "{} ▪ SAVED {}",
+                    song.station.to_uppercase(),
+                    saved_text(app.clock, song.saved).to_uppercase()
+                ),
+                room,
+            ),
+            Style::default().fg(theme.muted),
+        ),
+        Line::raw(""),
+    ];
+    let pending = app.vault.pending.contains(&song.key());
+    for (index, link) in links.iter().enumerate() {
+        let color = theme.service(link.service);
+        let current = index == selected;
+        let (tag, tag_color) = if link.direct {
+            ("direct", theme.accent)
+        } else if link.service == Service::Yandex && pending {
+            ("searching…", theme.warn)
+        } else {
+            ("search", theme.muted)
+        };
+        let row = Style::default().bg(if current { theme.selected } else { theme.bg });
+        let mut name = Style::default().fg(theme.fg);
+        if current {
+            name = name.add_modifier(Modifier::BOLD);
+        }
+        let used = 2 + 4 + 2 + 16;
+        lines.push(
+            Line::from(vec![
+                Span::styled(
+                    if current { "▌ " } else { "  " },
+                    Style::default().fg(color),
+                ),
+                Span::styled(
+                    format!("[{}] ", index + 1),
+                    Style::default().fg(theme.accent),
+                ),
+                Span::styled("↗ ", Style::default().fg(color)),
+                Span::styled(fit(link.service.name(), 16), name),
+                Span::styled(
+                    fit(tag, room.saturating_sub(used)),
+                    Style::default().fg(tag_color),
+                ),
+            ])
+            .style(row),
+        );
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        fit(&links[selected].url, room),
+        Style::default().fg(theme.muted),
+    ));
+    frame.render_widget(Paragraph::new(lines).block(block), popup);
+}
+
 fn account(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     let account = &app.account;
     let width = 66.min(area.width.saturating_sub(4));
@@ -1564,7 +1952,7 @@ fn account(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
 
 fn help(frame: &mut Frame, area: Rect, scroll: u16, theme: &Theme) {
     let width = 52.min(area.width.saturating_sub(4));
-    let height = 19.min(area.height);
+    let height = 21.min(area.height);
     let popup = Rect::new(
         area.x + (area.width - width) / 2,
         area.y + (area.height - height) / 2,
@@ -1580,6 +1968,8 @@ fn help(frame: &mut Frame, area: Rect, scroll: u16, theme: &Theme) {
         ("F7 / F9", "previous / next station"),
         ("− / =", "player volume, 2% steps"),
         ("f", "toggle favorite"),
+        ("l", "like / unlike song on air"),
+        ("v", "track vault: liked songs"),
         ("Esc", "close"),
         ("i", "toggle history"),
         ("d", "diagnostics"),
@@ -1600,14 +1990,14 @@ fn help(frame: &mut Frame, area: Rect, scroll: u16, theme: &Theme) {
     frame.render_widget(
         Paragraph::new(lines)
             .scroll((
-                scroll.min(15u16.saturating_sub(height.saturating_sub(4))),
+                scroll.min(17u16.saturating_sub(height.saturating_sub(4))),
                 0,
             ))
             .style(Style::default().fg(theme.fg).bg(theme.bg))
             .block(
                 Block::default()
                     .title(" Keys ")
-                    .title_bottom(if height < 19 {
+                    .title_bottom(if height < 21 {
                         " ↑↓  ? / Esc "
                     } else {
                         " ? / Esc "
@@ -1750,7 +2140,9 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(text.contains("Record  +"));
-        assert!(!text.contains(['♥', '♡']));
+        // Hearts belong to liked songs: only the header's song count has one.
+        assert!(!text.contains('♡'));
+        assert_eq!(text.matches('♥').count(), 1);
         assert!(!text.contains("radio-record"));
         app.category.select(Some(1));
         terminal
@@ -2051,6 +2443,7 @@ mod tests {
                     image200: String::new(),
                     time: 0,
                     time_formatted: "12:34".into(),
+                    ..Track::default()
                 })
                 .collect();
             terminal
@@ -2382,5 +2775,72 @@ mod tests {
             warn > 0 && warn.abs_diff(rest) <= 1,
             "half full: {warn} vs {rest}"
         );
+    }
+
+    #[test]
+    fn liking_shows_a_toast_and_a_heart() {
+        let mut app = playing_app();
+        app.uptime = Duration::from_secs(10);
+        crate::app::tests::press(&mut app, crossterm::event::KeyCode::Char('l'));
+        let (text, _) = render_text(&mut app, 100, 30);
+        assert!(text.contains("♥ SAVED TO VAULT"));
+        assert!(text.contains("♥ 1"), "the header counts liked songs");
+        assert!(!text.contains("VOL "), "the toast takes the volume notch");
+        app.uptime += crate::app::TOAST;
+        let (text, _) = render_text(&mut app, 100, 30);
+        assert!(text.contains("VOL ") && !text.contains("SAVED TO VAULT"));
+        let (text, _) = render_text(&mut app, 60, 16);
+        assert!(
+            text.contains("♥ "),
+            "the compact footer marks the liked track"
+        );
+    }
+
+    #[test]
+    fn the_vault_replaces_the_browser_and_the_card_shows_links() {
+        let mut app = fixture();
+        app.clock = 2_000_000_000;
+        for (artist, song) in [("Kölsch", "Grey"), ("Ласковый Май", "Белые розы")]
+        {
+            app.settings.songs.push(crate::songs::Song {
+                artist: artist.into(),
+                song: song.into(),
+                station: "Deep".into(),
+                saved: 2_000_000_000 - 7200,
+                ..Default::default()
+            });
+        }
+        crate::app::tests::press(&mut app, crossterm::event::KeyCode::Char('v'));
+        for (width, height) in [(100, 30), (44, 12)] {
+            let (text, _) = render_text(&mut app, width, height);
+            assert!(text.contains("TRACK VAULT"));
+            assert!(text.contains("Ласковый Май — Белые розы"));
+            assert!(!text.contains("CHANNELS") && !text.contains("SECTOR"));
+        }
+        let (text, _) = render_text(&mut app, 100, 30);
+        assert!(text.contains("SORT NEW ▾") && text.contains("01/02"));
+        assert!(text.contains("STATION") && text.contains("2h ago"));
+        crate::app::tests::press(&mut app, crossterm::event::KeyCode::Enter);
+        for (width, height) in [(100, 30), (44, 12)] {
+            let (text, _) = render_text(&mut app, width, height);
+            assert!(text.contains("YouTube Music") && text.contains("Spotify"));
+            assert!(text.contains("Yandex Music") && text.contains("searching…"));
+        }
+        app.settings.songs.clear();
+        app.vault.detail = None;
+        let (text, _) = render_text(&mut app, 100, 30);
+        assert!(text.contains("No saved tracks · l to like"));
+    }
+
+    #[test]
+    fn saved_dates_and_fitted_text() {
+        assert_eq!(saved_text(100, 90), "now");
+        assert_eq!(saved_text(10_000, 10_000 - 300), "5m ago");
+        assert_eq!(saved_text(1_791_720_000, 1_700_000_000), "2023-11-14");
+        assert_eq!(saved_text(5, 0), "—");
+        assert_eq!(fit("abc", 5), "abc  ");
+        assert_eq!(fit("abcdef", 4), "abc…");
+        assert_eq!(fit("音楽音楽", 5), "音楽…");
+        assert_eq!(fit("abc", 0), "");
     }
 }

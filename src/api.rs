@@ -360,7 +360,7 @@ pub struct Genre {
     pub name: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Track {
     pub id: i64,
     pub artist: String,
@@ -370,6 +370,12 @@ pub struct Track {
     /// When the track started on air (Unix seconds); 0 when unknown.
     pub time: i64,
     pub time_formatted: String,
+    /// Direct Apple Music link, the only per-track service link the API has.
+    pub itunes_url: String,
+    /// The radiorecord.ru page of the track.
+    pub share_url: String,
+    /// Jingles, ads, and shows: not a song that can be liked.
+    pub no_fav: bool,
 }
 
 fn decode_catalog(value: &JsonValue) -> Result<Catalog> {
@@ -467,6 +473,9 @@ fn decode_track(value: &JsonValue) -> Result<Track> {
             .and_then(JsonValue::as_i64)
             .unwrap_or(0),
         time_formatted: optional_string(value, "time_formatted"),
+        itunes_url: optional_string(value, "itunesUrl"),
+        share_url: optional_string(value, "shareUrl"),
+        no_fav: value.object_get("noFav") == Some(&JsonValue::Bool(true)),
     })
 }
 
@@ -689,7 +698,10 @@ pub(crate) mod tests {
                 "image100": "",
                 "image200": "",
                 "time": 1791638735,
-                "time_formatted": "12:34:56"
+                "time_formatted": "12:34:56",
+                "itunesUrl": "https://music.apple.com/us/album/x/1?i=2",
+                "shareUrl": "https://www.radiorecord.ru/track/123/",
+                "noFav": true
               }
             ]
           }
@@ -702,5 +714,15 @@ pub(crate) mod tests {
         assert_eq!(history[0].artist, "Test Artist");
         assert_eq!(history[0].song, "Test Song");
         assert_eq!(history[0].time, 1791638735);
+        assert_eq!(
+            history[0].share_url,
+            "https://www.radiorecord.ru/track/123/"
+        );
+        assert!(
+            history[0]
+                .itunes_url
+                .starts_with("https://music.apple.com/")
+        );
+        assert!(history[0].no_fav);
     }
 }

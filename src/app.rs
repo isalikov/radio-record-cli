@@ -1,17 +1,23 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MediaKeyCode};
 use ratatui::widgets::ListState;
-use std::{collections::VecDeque, time::Duration};
+use std::{
+    collections::{HashSet, VecDeque},
+    time::Duration,
+};
 
 use crate::{
     api::{Catalog, Station, Stream, Track},
     cover::Cover,
     player::{PlayerState, Snapshot},
     settings::Settings,
+    songs::Song,
 };
 
 // Sparkline memory: one sample per redraw, bounded independently of the terminal
 // width so a resize never reallocates the history.
 const METER_HISTORY: usize = 256;
+/// How long a toast stays in the now-playing border.
+pub const TOAST: Duration = Duration::from_millis(1600);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Category {
@@ -48,6 +54,69 @@ pub enum Action {
     Volume(u8),
     Refresh,
     Account(crate::account::Command),
+    /// Open each link in the browser.
+    Open(Vec<String>),
+    /// Copy a link to the clipboard.
+    Copy(String),
+    /// Look up a direct Yandex Music link for a saved song.
+    Lookup(Song),
+}
+
+/// Order of the track vault.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SongSort {
+    #[default]
+    Newest,
+    Artist,
+    Station,
+}
+
+impl SongSort {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Newest => "NEW",
+            Self::Artist => "ARTIST",
+            Self::Station => "STATION",
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            Self::Newest => Self::Artist,
+            Self::Artist => Self::Station,
+            Self::Station => Self::Newest,
+        }
+    }
+}
+
+/// The track vault screen: saved songs in place of the station browser, and
+/// the link card of one song on top of it.
+#[derive(Debug, Default)]
+pub struct Vault {
+    pub open: bool,
+    pub list: ListState,
+    pub sort: SongSort,
+    pub filter: String,
+    /// Typing goes into the filter.
+    pub filtering: bool,
+    /// Key of the song armed for deletion; a second `x` removes it.
+    pub armed: Option<String>,
+    /// Key of the song whose link card is open, and its selected link.
+    pub detail: Option<String>,
+    pub link: usize,
+    /// Yandex lookups started this session, so a miss is not repeated.
+    pub looked_up: HashSet<String>,
+    /// Lookups still running.
+    pub pending: HashSet<String>,
+}
+
+/// A short notice in the now-playing border, e.g. `♥ SAVED TO VAULT`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Toast {
+    pub since: Duration,
+    pub text: String,
+    /// False for refusals and failures.
+    pub good: bool,
 }
 
 pub struct App {
@@ -85,6 +154,8 @@ pub struct App {
     /// When the track on air last changed (`uptime`) and a seed for its
     /// title decode; set only by `set_history`.
     pub track_since: Option<(Duration, u64)>,
+    pub vault: Vault,
+    pub toast: Option<Toast>,
 }
 
 /// How far the track on air is, from its start time and the station's
@@ -127,7 +198,302 @@ impl App {
             clock: 0,
             fx: crate::fx::Fx::Off,
             track_since: None,
+            vault: Vault::default(),
+            toast: None,
         }
+    }
+
+    /// Show a toast from now; it fades by itself after `TOAST`.
+    pub fn notify(&mut self, text: impl Into<String>, good: bool) {
+        self.toast = Some(Toast {
+            since: self.uptime,
+            text: text.into(),
+            good,
+        });
+    }
+
+    /// The toast still on screen, if any.
+    pub fn active_toast(&self) -> Option<&Toast> {
+        self.toast
+            .as_ref()
+            .filter(|toast| crate::fx::progress(self.uptime, toast.since, TOAST).is_some())
+    }
+
+    /// The song on air, if it is one that can be liked.
+    fn song_on_air(&self) -> Option<&Track> {
+        self.now.as_ref()?;
+        self.history.first().filter(|track| {
+            !track.no_fav && !(track.artist.trim().is_empty() && track.song.trim().is_empty())
+        })
+    }
+
+    /// Whether the song on air is in the vault.
+    pub fn on_air_liked(&self) -> bool {
+        self.song_on_air().is_some_and(|track| {
+            let key = crate::songs::key(&track.artist, &track.song);
+            self.settings.songs.iter().any(|song| song.key() == key)
+        })
+    }
+
+    /// Like or unlike the song on air.
+    fn like(&mut self) -> Action {
+        let Some(track) = self.song_on_air() else {
+            let text = if self.now.is_some() && !self.history.is_empty() {
+                "! NOT A SONG"
+            } else {
+                "! NO TRACK ON AIR"
+            };
+            self.notify(text, false);
+            return Action::None;
+        };
+        let station = self.now.as_ref().map_or("", |now| now.title.as_str());
+        let song = Song::from_track(track, station, self.clock);
+        let key = song.key();
+        self.dirty = true;
+        if let Some(index) = self
+            .settings
+            .songs
+            .iter()
+            .position(|saved| saved.key() == key)
+        {
+            self.settings.songs.remove(index);
+            self.notify("♡ REMOVED FROM VAULT", true);
+            self.clamp_vault();
+            return Action::None;
+        }
+        self.settings.songs.push(song.clone());
+        self.notify("♥ SAVED TO VAULT", true);
+        self.clamp_vault();
+        self.lookup(song)
+    }
+
+    /// Start a Yandex lookup once per song and session.
+    fn lookup(&mut self, song: Song) -> Action {
+        let key = song.key();
+        if !song.yandex_url.is_empty() || !self.vault.looked_up.insert(key.clone()) {
+            return Action::None;
+        }
+        self.vault.pending.insert(key);
+        Action::Lookup(song)
+    }
+
+    /// Accept a finished Yandex lookup. A failed request (as opposed to no
+    /// match) may be retried the next time the song's card opens.
+    pub fn set_yandex(&mut self, key: &str, result: crate::error::Result<Option<String>>) {
+        self.vault.pending.remove(key);
+        let Ok(url) = result else {
+            self.vault.looked_up.remove(key);
+            return;
+        };
+        if let Some(url) = url
+            && let Some(song) = self
+                .settings
+                .songs
+                .iter_mut()
+                .find(|song| song.key() == key)
+        {
+            song.yandex_url = url;
+            self.dirty = true;
+        }
+    }
+
+    /// Saved songs as the vault shows them: filtered, then sorted.
+    pub fn vault_songs(&self) -> Vec<&Song> {
+        let filter = self.vault.filter.to_lowercase();
+        let mut songs: Vec<&Song> = self
+            .settings
+            .songs
+            .iter()
+            .filter(|song| {
+                filter.is_empty()
+                    || [&song.artist, &song.song, &song.station]
+                        .iter()
+                        .any(|text| text.to_lowercase().contains(&filter))
+            })
+            .collect();
+        match self.vault.sort {
+            SongSort::Newest => songs.reverse(),
+            SongSort::Artist => songs.sort_by_cached_key(|song| song.key()),
+            SongSort::Station => {
+                songs.reverse();
+                songs.sort_by_cached_key(|song| song.station.to_lowercase());
+            }
+        }
+        songs
+    }
+
+    pub fn selected_song(&self) -> Option<&Song> {
+        self.vault_songs().get(self.vault.list.selected()?).copied()
+    }
+
+    /// The song whose link card is open.
+    pub fn detail_song(&self) -> Option<&Song> {
+        let key = self.vault.detail.as_ref()?;
+        self.settings.songs.iter().find(|song| song.key() == *key)
+    }
+
+    fn clamp_vault(&mut self) {
+        let count = self.vault_songs().len();
+        clamp_selection(&mut self.vault.list, count);
+    }
+
+    fn remove_song(&mut self, key: &str) {
+        self.settings.songs.retain(|song| song.key() != key);
+        self.dirty = true;
+        self.vault.armed = None;
+        self.notify("♡ REMOVED FROM VAULT", true);
+        self.clamp_vault();
+    }
+
+    /// Keys while the vault is open. Playback keys that make sense anywhere
+    /// fall through to the main keymap.
+    fn vault_key(&mut self, key: KeyEvent) -> Option<Action> {
+        if self.vault.detail.is_some() {
+            return self.detail_key(key);
+        }
+        if self.vault.filtering {
+            match key.code {
+                KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.vault.filter.push(character);
+                    self.vault.list.select(Some(0));
+                    self.clamp_vault();
+                    return Some(Action::None);
+                }
+                KeyCode::Backspace => {
+                    self.vault.filter.pop();
+                    self.clamp_vault();
+                    return Some(Action::None);
+                }
+                KeyCode::Enter => {
+                    self.vault.filtering = false;
+                    return Some(Action::None);
+                }
+                KeyCode::Esc => {
+                    self.vault.filtering = false;
+                    self.vault.filter.clear();
+                    self.clamp_vault();
+                    return Some(Action::None);
+                }
+                _ => {}
+            }
+        }
+        let count = self.vault_songs().len();
+        let delta = match key.code {
+            KeyCode::Up | KeyCode::Char('k') => Some(-1),
+            KeyCode::Down | KeyCode::Char('j') => Some(1),
+            KeyCode::PageUp => Some(-10),
+            KeyCode::PageDown => Some(10),
+            KeyCode::Home => Some(isize::MIN),
+            KeyCode::End => Some(isize::MAX),
+            _ => None,
+        };
+        if let Some(delta) = delta {
+            self.vault.armed = None;
+            move_selection(&mut self.vault.list, count, delta);
+            return Some(Action::None);
+        }
+        match key.code {
+            KeyCode::Esc if self.vault.armed.is_some() => self.vault.armed = None,
+            KeyCode::Esc if !self.vault.filter.is_empty() => {
+                self.vault.filter.clear();
+                self.clamp_vault();
+            }
+            KeyCode::Esc | KeyCode::Char('v') => {
+                self.vault.open = false;
+                self.vault.armed = None;
+            }
+            KeyCode::Char('/') => self.vault.filtering = true,
+            KeyCode::Char('o') => {
+                self.vault.sort = self.vault.sort.next();
+                self.vault.list.select(Some(0));
+                self.clamp_vault();
+            }
+            KeyCode::Enter => {
+                let Some(song) = self.selected_song().cloned() else {
+                    return Some(Action::None);
+                };
+                self.vault.armed = None;
+                self.vault.detail = Some(song.key());
+                self.vault.link = 0;
+                return Some(self.lookup(song));
+            }
+            KeyCode::Char('x') | KeyCode::Delete => {
+                let Some(key) = self.selected_song().map(Song::key) else {
+                    return Some(Action::None);
+                };
+                if self.vault.armed.as_deref() == Some(key.as_str()) {
+                    self.remove_song(&key);
+                } else {
+                    self.vault.armed = Some(key);
+                }
+            }
+            KeyCode::Char('-' | '=' | '+' | ' ' | 's' | 'l' | 'r' | 'q' | '?' | 'd') => {
+                return None;
+            }
+            _ => {}
+        }
+        Some(Action::None)
+    }
+
+    /// Keys in a song's link card.
+    fn detail_key(&mut self, key: KeyEvent) -> Option<Action> {
+        let Some(song) = self.detail_song() else {
+            self.vault.detail = None;
+            return Some(Action::None);
+        };
+        let links = song.links();
+        let song_key = song.key();
+        let open = |app: &mut Self, index: usize| {
+            let link = &links[index];
+            app.notify(format!("↗ {}", link.service.name().to_uppercase()), true);
+            Action::Open(vec![link.url.clone()])
+        };
+        let action = match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.vault.link = self.vault.link.saturating_sub(1);
+                Action::None
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.vault.link = (self.vault.link + 1).min(links.len() - 1);
+                Action::None
+            }
+            KeyCode::Enter => open(self, self.vault.link.min(links.len() - 1)),
+            KeyCode::Char(digit @ '1'..='9') => {
+                let index = digit as usize - '1' as usize;
+                if index < links.len() {
+                    self.vault.link = index;
+                    open(self, index)
+                } else {
+                    Action::None
+                }
+            }
+            KeyCode::Char('a') => {
+                self.notify("↗ ALL LINKS", true);
+                Action::Open(links.iter().map(|link| link.url.clone()).collect())
+            }
+            KeyCode::Char('c') => {
+                self.notify("» LINK COPIED", true);
+                Action::Copy(links[self.vault.link.min(links.len() - 1)].url.clone())
+            }
+            KeyCode::Char('x') | KeyCode::Delete => {
+                if self.vault.armed.as_deref() == Some(song_key.as_str()) {
+                    self.remove_song(&song_key);
+                    self.vault.detail = None;
+                } else {
+                    self.vault.armed = Some(song_key);
+                }
+                Action::None
+            }
+            KeyCode::Esc | KeyCode::Backspace => {
+                if self.vault.armed.take().is_none() {
+                    self.vault.detail = None;
+                }
+                Action::None
+            }
+            KeyCode::Char('-' | '=' | '+' | ' ' | 's' | 'l' | 'q') => return None,
+            _ => Action::None,
+        };
+        Some(action)
     }
 
     /// The cover URL the panel needs but has not requested yet.
@@ -344,7 +710,7 @@ impl App {
         if self.help {
             match key.code {
                 KeyCode::Down | KeyCode::Char('j') => {
-                    self.help_scroll = (self.help_scroll + 1).min(14)
+                    self.help_scroll = (self.help_scroll + 1).min(16)
                 }
                 KeyCode::Up | KeyCode::Char('k') => {
                     self.help_scroll = self.help_scroll.saturating_sub(1)
@@ -369,6 +735,11 @@ impl App {
             }
             return Action::None;
         }
+        if self.vault.open
+            && let Some(action) = self.vault_key(key)
+        {
+            return action;
+        }
         match key.code {
             KeyCode::Char('q') => return Action::Quit,
             KeyCode::Char('?') => {
@@ -377,6 +748,11 @@ impl App {
             }
             KeyCode::Char('d') => self.show_diag = true,
             KeyCode::Char('a') => self.account.open = true,
+            KeyCode::Char('l') => return self.like(),
+            KeyCode::Char('v') => {
+                self.vault.open = true;
+                self.clamp_vault();
+            }
             KeyCode::Esc => self.error = None,
             KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => self.change_category(-1),
             KeyCode::Tab => self.change_category(1),
@@ -737,7 +1113,7 @@ pub mod tests {
             image100: image.into(),
             image200: String::new(),
             time,
-            time_formatted: String::new(),
+            ..Track::default()
         }
     }
 
@@ -833,5 +1209,207 @@ pub mod tests {
         );
         app.set_history(id, vec![track(200, ""), track(100, "")]);
         assert_eq!(app.track_since.unwrap().0, Duration::from_secs(20));
+    }
+
+    fn on_air(app: &mut App, artist: &str, song: &str) {
+        if app.now.is_none() {
+            press(app, KeyCode::Enter);
+        }
+        let id = app.now.as_ref().unwrap().id;
+        let mut track = track(100, "");
+        track.artist = artist.into();
+        track.song = song.into();
+        app.set_history(id, vec![track]);
+    }
+
+    #[test]
+    fn l_likes_and_unlikes_the_song_on_air_only() {
+        let mut app = fixture();
+        assert!(matches!(press(&mut app, KeyCode::Char('l')), Action::None));
+        assert_eq!(app.toast.as_ref().unwrap().text, "! NO TRACK ON AIR");
+        assert!(app.settings.songs.is_empty());
+        on_air(&mut app, "Armin van Buuren", "Blue Fear");
+        app.clock = 1_000;
+        press(&mut app, KeyCode::Down); // Browsing does not change what is liked.
+        assert!(matches!(
+            press(&mut app, KeyCode::Char('l')),
+            Action::Lookup(_)
+        ));
+        assert!(app.on_air_liked() && app.dirty);
+        let saved = &app.settings.songs[0];
+        assert_eq!((saved.station.as_str(), saved.saved), ("Record", 1_000));
+        assert_eq!(app.toast.as_ref().unwrap().text, "♥ SAVED TO VAULT");
+        press(&mut app, KeyCode::Char('l'));
+        assert!(app.settings.songs.is_empty() && !app.on_air_liked());
+        // A second like of the same song starts no second lookup.
+        assert!(matches!(press(&mut app, KeyCode::Char('l')), Action::None));
+        assert_eq!(app.settings.songs.len(), 1);
+        app.history[0].no_fav = true;
+        press(&mut app, KeyCode::Char('l'));
+        assert_eq!(app.settings.songs.len(), 1);
+        assert_eq!(app.toast.as_ref().unwrap().text, "! NOT A SONG");
+    }
+
+    #[test]
+    fn toasts_expire() {
+        let mut app = fixture();
+        app.uptime = Duration::from_secs(3);
+        app.notify("hi", true);
+        assert!(app.active_toast().is_some());
+        app.uptime += TOAST;
+        assert!(app.active_toast().is_none());
+    }
+
+    fn vault_app() -> App {
+        let mut app = fixture();
+        for (index, (artist, song, station)) in [
+            ("Kölsch", "Grey", "Deep"),
+            ("Armin van Buuren", "Blue Fear", "Trance"),
+            ("Ласковый Май", "Белые розы", "Гоп FM"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            app.settings.songs.push(Song {
+                artist: artist.into(),
+                song: song.into(),
+                station: station.into(),
+                saved: index as i64,
+                ..Song::default()
+            });
+        }
+        app
+    }
+
+    fn titles(app: &App) -> Vec<String> {
+        app.vault_songs()
+            .iter()
+            .map(|song| song.song.clone())
+            .collect()
+    }
+
+    #[test]
+    fn the_vault_sorts_filters_and_keeps_browsing_separate() {
+        let mut app = vault_app();
+        press(&mut app, KeyCode::Char('v'));
+        assert!(app.vault.open);
+        assert_eq!(
+            titles(&app),
+            ["Белые розы", "Blue Fear", "Grey"],
+            "newest first"
+        );
+        press(&mut app, KeyCode::Char('o'));
+        assert_eq!(
+            titles(&app),
+            ["Blue Fear", "Grey", "Белые розы"],
+            "by artist"
+        );
+        press(&mut app, KeyCode::Char('o'));
+        assert_eq!(
+            titles(&app),
+            ["Grey", "Blue Fear", "Белые розы"],
+            "by station"
+        );
+        press(&mut app, KeyCode::Char('o'));
+        for character in "/РОЗ".chars() {
+            press(&mut app, KeyCode::Char(character));
+        }
+        assert_eq!(titles(&app), ["Белые розы"]);
+        // While filtering, letters are text, not commands.
+        press(&mut app, KeyCode::Char('q'));
+        assert!(titles(&app).is_empty());
+        press(&mut app, KeyCode::Backspace);
+        press(&mut app, KeyCode::Enter);
+        assert!(!app.vault.filtering && app.vault.detail.is_none());
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(titles(&app).len(), 3, "Esc clears the filter first");
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.selected_song().unwrap().song, "Blue Fear");
+        assert_eq!(app.stations.selected(), Some(0), "stations stay put");
+        assert!(matches!(
+            press(&mut app, KeyCode::Char('=')),
+            Action::Volume(_)
+        ));
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.vault.open);
+        assert!(app.now.is_none());
+    }
+
+    #[test]
+    fn vault_deletes_only_on_a_second_press() {
+        let mut app = vault_app();
+        press(&mut app, KeyCode::Char('v'));
+        press(&mut app, KeyCode::Char('x'));
+        assert_eq!(app.settings.songs.len(), 3);
+        press(&mut app, KeyCode::Esc);
+        assert!(app.vault.open && app.vault.armed.is_none(), "Esc disarms");
+        press(&mut app, KeyCode::Char('x'));
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Char('x'));
+        assert_eq!(app.settings.songs.len(), 3, "moving disarms");
+        press(&mut app, KeyCode::Delete);
+        assert_eq!(app.settings.songs.len(), 2);
+        assert!(
+            app.settings
+                .songs
+                .iter()
+                .all(|song| song.song != "Blue Fear")
+        );
+        assert_eq!(app.vault.list.selected(), Some(1));
+        app.settings.songs.clear();
+        app.vault.list.select(None);
+        assert!(matches!(press(&mut app, KeyCode::Enter), Action::None));
+        assert!(app.now.is_none(), "Enter in an empty vault plays nothing");
+    }
+
+    #[test]
+    fn the_link_card_opens_copies_and_looks_up_once() {
+        let mut app = vault_app();
+        press(&mut app, KeyCode::Char('v'));
+        let Action::Lookup(song) = press(&mut app, KeyCode::Enter) else {
+            panic!("opening a card looks up the Yandex link");
+        };
+        assert_eq!(song.song, "Белые розы");
+        assert!(app.vault.pending.contains(&song.key()));
+        let Action::Open(urls) = press(&mut app, KeyCode::Enter) else {
+            panic!("Enter opens the selected link");
+        };
+        assert!(urls[0].starts_with("https://music.youtube.com/search?q="));
+        let Action::Open(urls) = press(&mut app, KeyCode::Char('2')) else {
+            panic!("digits open a service");
+        };
+        assert!(urls[0].starts_with("https://open.spotify.com/search/"));
+        assert_eq!(app.vault.link, 1);
+        press(&mut app, KeyCode::Down);
+        let Action::Copy(url) = press(&mut app, KeyCode::Char('c')) else {
+            panic!("c copies");
+        };
+        assert!(url.starts_with("https://music.yandex.ru/search?text="));
+        let Action::Open(all) = press(&mut app, KeyCode::Char('a')) else {
+            panic!("a opens all");
+        };
+        assert_eq!(all.len(), 4);
+        app.set_yandex(&song.key(), Err(crate::error::Error::new("429")));
+        assert!(app.vault.pending.is_empty());
+        assert!(!app.vault.looked_up.contains(&song.key()), "failures retry");
+        app.set_yandex(
+            &song.key(),
+            Ok(Some("https://music.yandex.ru/album/1/track/2".into())),
+        );
+        assert!(app.vault.pending.is_empty() && app.dirty);
+        let Action::Copy(url) = press(&mut app, KeyCode::Char('c')) else {
+            panic!("c copies");
+        };
+        assert_eq!(url, "https://music.yandex.ru/album/1/track/2");
+        press(&mut app, KeyCode::Esc);
+        assert!(app.vault.detail.is_none() && app.vault.open);
+        assert!(
+            matches!(press(&mut app, KeyCode::Enter), Action::None),
+            "no second lookup"
+        );
+        press(&mut app, KeyCode::Char('x'));
+        press(&mut app, KeyCode::Char('x'));
+        assert_eq!(app.settings.songs.len(), 2);
+        assert!(app.vault.detail.is_none());
     }
 }

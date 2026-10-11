@@ -9,6 +9,7 @@ mod json;
 mod media;
 mod player;
 mod settings;
+mod songs;
 mod spectrum;
 mod ui;
 
@@ -57,6 +58,8 @@ struct Network {
     history: Option<(i64, Receiver<Result<Vec<Track>>>)>,
     history_updated: Instant,
     cover: Option<(String, Receiver<Result<Cover>>)>,
+    /// Yandex Music lookups by song key.
+    lookups: Vec<(String, Receiver<Result<Option<String>>>)>,
 }
 
 impl Network {
@@ -67,6 +70,7 @@ impl Network {
             history: None,
             history_updated: Instant::now(),
             cover: None,
+            lookups: Vec::new(),
         }
     }
     fn catalog(&mut self, app: &mut App) {
@@ -146,6 +150,18 @@ impl Network {
                 Err(mpsc::TryRecvError::Empty) => {}
             }
         }
+        self.lookups.retain(|(key, rx)| match rx.try_recv() {
+            Ok(result) => {
+                // A failed lookup keeps the search link; it is not an error.
+                app.set_yandex(key, result);
+                false
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                app.set_yandex(key, Err(Error::new("lookup interrupted")));
+                false
+            }
+            Err(mpsc::TryRecvError::Empty) => true,
+        });
         if self.cover.is_none()
             && let Some(url) = app.wanted_cover().map(str::to_owned)
         {
@@ -255,6 +271,25 @@ fn dispatch(action: Action, app: &mut App, player: &mut Player, network: &mut Ne
             network.history(app);
         }
         Action::Account(command) => network.account.command(command, app),
+        Action::Open(urls) => {
+            for url in urls {
+                if let Err(err) = songs::open(&url) {
+                    app.notify(format!("! {err}"), false);
+                    break;
+                }
+            }
+        }
+        Action::Copy(url) => {
+            if songs::copy(&url).is_err() {
+                app.notify("! COPY FAILED", false);
+            }
+        }
+        Action::Lookup(song) => {
+            let key = song.key();
+            network
+                .lookups
+                .push((key, fetch(move || songs::lookup_yandex(&song))));
+        }
         Action::None | Action::Quit => {}
     }
 }

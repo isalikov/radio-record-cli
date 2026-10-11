@@ -165,6 +165,8 @@ Bug reports, station suggestions, and small improvements are welcome too.
 | F8 / Space | Play / pause |
 | - / = | Player volume, 2% steps, 0–100% |
 | f | Toggle favorite |
+| l | Like / unlike the song on air |
+| v | Open / close the track vault (liked songs) |
 | i | Show / hide recent tracks |
 | d | Toggle diagnostics overlay |
 | a | Open account, sign in, sync favorites, or sign out |
@@ -177,7 +179,8 @@ Bug reports, station suggestions, and small improvements are welcome too.
 Previous/next follows the playing station when it is in the current category;
 otherwise it starts at the selected station. Unavailable streams are skipped.
 Function transport keys also work while help is open.
-Left/right arrows have no action. History is read-only. There is no search.
+Left/right arrows have no action. History is read-only. There is no station
+search; the track vault has its own filter.
 
 Favorites have a small magenta `+` outside the Favorites category. Inside Favorites,
 the category itself identifies them, so the marker is hidden. Station and track
@@ -190,6 +193,45 @@ owns the active media session, including when its terminal is unfocused.
 The session shows the station name and playback state and is cleared on
 stop, playback failure, or exit. Fn+F7/F8/F9 sends ordinary function keys to
 the terminal. No global keyboard interception is installed.
+
+## Liked songs
+
+Press `l` to save the song on air to the track vault; press it again to
+remove it. The now-playing border briefly shows `♥ SAVED TO VAULT`, the title
+gets a `♥` while the song stays liked, and the header counts liked songs.
+Jingles and shows marked by the API cannot be liked (`! NOT A SONG`).
+Browsing never changes which song `l` saves: it is always the one on air.
+
+Press `v` to open the vault in place of the station browser; the status line
+and now-playing panel stay. It lists artist, title, the station the song was
+heard on, and when it was saved.
+
+| Key | In the vault |
+| --- | --- |
+| ↑ / ↓, j / k, PgUp / PgDn, Home / End | Select a song |
+| Enter | Open the song's links |
+| / | Filter by artist, title, or station; Enter keeps it, Esc clears it |
+| o | Sort: newest, artist, station |
+| x / Delete | Delete; press again to confirm, Esc cancels |
+| v / Esc | Back to stations |
+
+The link card lists YouTube Music, Spotify, Yandex Music, Apple Music, and
+the radiorecord.ru track page when the API provides one. `↑ / ↓` and Enter,
+or `1`–`5`, open a link in the default browser (`open` on macOS, `xdg-open`
+on Linux); `c` copies the selected link through the terminal clipboard
+(OSC 52, ignored by terminals without it, such as Terminal.app); `a` opens
+all; `x` deletes; Esc goes back. Each row says `direct` for a link to the
+track itself and `search` for a search by artist and title. Apple Music and
+the Radio Record page come directly from the API. Spotify and YouTube Music
+have no public anonymous lookup, so they are searches. Yandex Music starts
+as a search; on like and when a card opens, the player asks the unofficial
+Yandex Music search API for a direct link (`searching…`) and keeps it only
+when artist and title match. Failed lookups are retried the next time the
+card opens. Search text drops bracketed tags such as `(Record Mix)`.
+
+Volume, play/pause, stop, `l`, and quit keep working in the vault and card.
+Liked songs are stored locally in `settings.json` and are not synced to the
+Radio Record account.
 
 ## Account and favorites sync
 
@@ -308,7 +350,7 @@ engine decodes AAC in-process. macOS system media controls belong to radio-recor
 and remain available across station changes. Volume is software gain
 and does not change system volume.
 
-Favorites and volume are saved atomically in `~/.config/radio-record/settings.json`.
+Favorites, volume, and liked songs are saved atomically in `~/.config/radio-record/settings.json`.
 Directory precedence: `RADIO_RECORD_CONFIG_DIR`, `$XDG_CONFIG_HOME/radio-record`,
 `~/.config/radio-record`. Corrupt settings are reported rather than overwritten.
 
