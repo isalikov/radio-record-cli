@@ -17,6 +17,11 @@ All notable changes to this project are documented here.
   from the API; Yandex Music is upgraded to a direct link by a background
   lookup when artist and title match.
 
+### Changed
+
+- README: new screenshot, quick start, feature overview, and a configuration
+  table; build and troubleshooting notes moved to their own sections.
+
 ## [v3.1.0] - 2026-10-11
 
 ### Added

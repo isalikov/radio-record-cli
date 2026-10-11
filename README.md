@@ -1,82 +1,60 @@
-# radio-record
+<h1 align="center">◢ RADIO//RECORD ◣</h1>
 
 <p align="center">
-  <strong>A keyboard-first internet radio player for macOS and Linux.</strong><br>
-  Browse stations, control playback, and keep the music in focus.
+  <strong>A keyboard-only cyberpunk radio player for the terminal.</strong><br>
+  100+ <a href="https://www.radiorecord.ru/">Radio Record</a> stations, a live spectrum visualizer, and a vault for the songs you catch on air.
 </p>
 
 <p align="center">
-  <a href="https://github.com/isalikov/radio-record-cli/releases"><img src="https://img.shields.io/github/v/release/isalikov/radio-record-cli?style=flat-square&color=ff2bd6" alt="Latest release"></a>
-  <a href="https://github.com/isalikov/radio-record-cli/actions/workflows/release.yml"><img src="https://img.shields.io/github/actions/workflow/status/isalikov/radio-record-cli/release.yml?style=flat-square&label=release" alt="Release build"></a>
+  <a href="https://github.com/isalikov/radio-record-cli/releases"><img src="https://img.shields.io/github/v/release/isalikov/radio-record-cli?style=flat-square&color=ff2a6d&label=release" alt="Latest release"></a>
+  <a href="https://github.com/isalikov/radio-record-cli/actions/workflows/release.yml"><img src="https://img.shields.io/github/actions/workflow/status/isalikov/radio-record-cli/release.yml?style=flat-square&label=build&color=00f0ff" alt="Release build"></a>
+  <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux-9d4dff?style=flat-square" alt="macOS and Linux">
+  <img src="https://img.shields.io/badge/rust-2024-fcee0a?style=flat-square&labelColor=13111f" alt="Rust 2024">
 </p>
 
 <p align="center">
-  <img src="assets/player-preview.png" alt="radio-record player preview">
+  <img src="assets/player-preview.png" alt="radio-record: station browser, track history, and the now-playing panel with cover art and spectrum visualizer">
 </p>
 
 <p align="center">
-  <a href="#install">Install</a> ·
+  <a href="#quick-start">Quick start</a> ·
+  <a href="#features">Features</a> ·
   <a href="#keyboard">Keyboard</a> ·
+  <a href="#liked-songs">Liked songs</a> ·
+  <a href="#configuration">Configuration</a> ·
+  <a href="#troubleshooting">Troubleshooting</a> ·
   <a href="#support">Support</a>
 </p>
 
-Keyboard-only Rust radio player for [Radio Record](https://www.radiorecord.ru/).
-The screen is a cyberpunk HUD: a status line on top, then framed panels for
-categories (SECTOR), stations (CHANNELS), and recent tracks (INTERCEPT LOG),
-and a NOW PLAYING window with cover art and a spectrum visualizer at the
-bottom. Neon cyan marks playback; neon magenta marks the selected category,
-favorites, and live badges; acid yellow marks buffering and faults.
-
-## Run
-
-Building from source requires Rust/Cargo. On Linux, also install the ALSA
-headers and pkg-config (`sudo apt install libasound2-dev pkg-config` on
-Debian/Ubuntu). Release binaries need only the ALSA runtime library
-(`libasound.so.2`); macOS uses the built-in CoreAudio framework. HTTP, TLS,
-and AAC decoding are compiled into the binary.
-
-Audio uses the built-in engine: direct AAC-LC streams and the AAC-LC variant
-of HLS. HE-AAC-only stations are unsupported and report a clear error.
-
-The Rust toolchain is pinned in `mise.toml`. With [mise](https://mise.jdx.dev) installed,
-`mise install` in this directory fetches the right `cargo`, `rustfmt`, and `clippy`.
-Any other Rust installation (rustup, distro package) works as well.
+## Quick start
 
 ```sh
-mise install
-make run
+curl -fsSL https://raw.githubusercontent.com/isalikov/radio-record-cli/master/scripts/install.sh | sh
+radio-record
 ```
 
-Plain `make` prints help. Minimum terminal size: 44 × 12. History is hidden in
-short windows to leave room for stations. Truecolor terminals show the full palette.
-Windows at least 21 rows tall show the now-playing panel; 31 rows and more
-give it a larger cover, a metadata line, and a separate telemetry line.
-Shorter windows keep a compact footer with the visualizer above the status
-line. The top line shows the playback state (`◉ ON AIR`, `◉ SYNC 42%`,
-`▮▮ HOLD`, `! FAULT`, or `○ STANDBY`), the favorite count, and uptime.
+Pick a station with the arrows and press Enter. Press `l` when a song you like
+comes on, `v` to see every song you saved, and `?` for all keys.
 
-`RADIO_RECORD_COVER` selects how covers are drawn: `pixel` (default) draws
-pixel art with half-block characters in any truecolor terminal; `sharp` asks
-the terminal at startup for a picture protocol (kitty, sixel, or iTerm2) and
-shows the real image, falling back to pixel art when none is offered or while
-a popup is open. Use `sharp` only in a terminal emulator: a terminal that
-never answers the query delays startup by 2 seconds and swallows the first key.
-An unknown value falls back to `pixel` with a note on stderr.
+## Features
 
-`RADIO_RECORD_THEME` selects a color theme: `default` (NEON-77: neon cyan,
-magenta, and violet on near-black),
-`amber` (monochrome amber CRT), `phosphor` (green terminal), or `paper`
-(light, for white terminals). An unknown name falls back to `default` with a
-note on stderr. `NO_COLOR` disables colors and takes precedence over the theme.
+| | |
+| --- | --- |
+| **Every station** | The full Radio Record catalog, grouped by genre, with favorites on `f`. |
+| **Native audio** | A built-in AAC decoder plays through CoreAudio or ALSA. No ffmpeg, mpv, or VLC. |
+| **Spectrum visualizer** | 96 frequency bands from a real FFT of the audio you hear, with falling peak caps. |
+| **Now playing** | Cover art (pixel art, or real images on kitty, sixel, and iTerm2), track progress, stream format. |
+| **Track vault** | `l` saves the song on air. The vault links each song to YouTube Music, Spotify, Yandex Music, and Apple Music. |
+| **Track history** | The INTERCEPT LOG shows what the station played before. |
+| **Account sync** | Sign in to sync favorite stations with your Radio Record account. |
+| **Media keys** | F7/F8/F9 everywhere; on macOS, the system play/pause and track keys too. |
+| **Themes and motion** | NEON-77, amber, phosphor, and paper themes; `NO_COLOR`; three motion levels. |
 
-`RADIO_RECORD_FX` selects how much the interface moves: `full` (default),
-`calm`, or `off`. Motion that follows the audio runs in `full` and `calm`:
-the visualizer's peak caps, the now-playing frame brightening with the bass,
-and the `SIGNAL ACQUIRING` fill that tracks the real buffering percentage.
-Decorative motion runs only in `full`: a new track's title decodes into place
-over about half a second, and `◉ ON AIR` pulses once a second while playing.
-`off` keeps the interface still apart from the visualizer itself. `NO_COLOR`
-caps the mode at `calm`; an unknown value means `full` with a note on stderr.
+The screen is a HUD: a status line on top, then framed panels for categories
+(SECTOR), stations (CHANNELS), and recent tracks (INTERCEPT LOG), and a NOW
+PLAYING window with cover art and the visualizer at the bottom. Neon cyan marks
+playback; neon magenta marks the selected category, favorites, and live badges;
+acid yellow marks buffering and faults.
 
 ## Install
 
@@ -97,35 +75,6 @@ not in `PATH`, add it once in your shell profile.
 The binary uses CoreAudio on macOS and the ALSA runtime library on Linux.
 HTTP, TLS, and AAC decoding are built in.
 
-### Troubleshooting
-
-**`audio device failed · Enter to retry`** — the native output stream reported
-a fatal error. Press Enter to reopen it. Brief device underruns/overruns,
-automatic audio-route changes, and denied real-time scheduling do not stop
-playback; a brief audio glitch may still be audible.
-
-**`audio device error: ... Sample rate update timed out`** — CoreAudio could
-not finish opening the output while the device format was changing. Press
-Enter to retry. radio-record opens the current hardware rate, including lower-rate
-Bluetooth call formats such as 24 kHz, and resamples radio audio to it. Mono
-output mixes both channels. On macOS the hardware clock is read separately
-from the virtual stream format, so a call's lower rate is preserved. Bluetooth
-headphones can sound less clear while their microphone is active.
-
-**`HE-AAC streams are unsupported · select another station`** — the station
-only offers streams the built-in AAC-LC decoder cannot play. Select a station
-with a direct AAC-LC stream or an AAC-LC HLS variant.
-
-**`<host> unreachable · Enter to retry`** — the player could not open any of
-the station's streams. radio-record falls back from the direct streams to HLS and
-then retries the whole list two more times, 2 seconds apart, before showing
-this; the message names the hosts that failed. The HLS host is a rotating DNS
-pool, so a retry can land on an address that works. A VPN or split-tunnel rule
-that sends some of these addresses around the tunnel is a common cause: route
-`*.hostingradio.ru` and `*.magonet.ru` through the VPN, or check with
-`curl -sI https://radiorecord.hostingradio.ru/rr_main96.aacp`. Other errors
-are shown as `Stream unavailable: <reason>`.
-
 ## Uninstall
 
 ```sh
@@ -143,16 +92,6 @@ curl -fsSL https://raw.githubusercontent.com/isalikov/radio-record-cli/master/sc
 
 Settings live in `~/.config/radio-record` by default; the script honours the same
 `RADIO_RECORD_CONFIG_DIR` and `XDG_CONFIG_HOME` overrides as the app.
-
-## Support
-
-If radio-record is useful to you, you can support its development on Ko-fi:
-
-<p align="center">
-  <a href="https://ko-fi.com/isalikov"><img src="https://ko-fi.com/img/githubbutton_sm.svg" alt="Support radio-record on Ko-fi"></a>
-</p>
-
-Bug reports, station suggestions, and small improvements are welcome too.
 
 ## Keyboard
 
@@ -273,6 +212,49 @@ next to `settings.json`, with owner-only permissions on Unix. Signing out remove
 that file. Cookies and passwords are not stored. `RADIO_RECORD_CONFIG_DIR` and
 `XDG_CONFIG_HOME` apply to both files.
 
+## Configuration
+
+| Variable | Values | Effect |
+| --- | --- | --- |
+| `RADIO_RECORD_THEME` | `default`, `amber`, `phosphor`, `paper` | Color theme |
+| `RADIO_RECORD_FX` | `full`, `calm`, `off` | How much the interface moves |
+| `RADIO_RECORD_COVER` | `pixel`, `sharp` | Pixel-art or real cover images |
+| `RADIO_RECORD_CONFIG_DIR` | path | Where settings are stored |
+| `RADIO_RECORD_BASE_URL` | URL | API base, for development |
+| `NO_COLOR` | any non-empty value | Disables colors; wins over the theme |
+
+Minimum terminal size: 44 × 12. History is hidden in
+short windows to leave room for stations. Truecolor terminals show the full palette.
+Windows at least 21 rows tall show the now-playing panel; 31 rows and more
+give it a larger cover, a metadata line, and a separate telemetry line.
+Shorter windows keep a compact footer with the visualizer above the status
+line. The top line shows the playback state (`◉ ON AIR`, `◉ SYNC 42%`,
+`▮▮ HOLD`, `! FAULT`, or `○ STANDBY`), the favorite station count, the
+liked-song count (`♥ 3`), and uptime.
+
+`RADIO_RECORD_COVER` selects how covers are drawn: `pixel` (default) draws
+pixel art with half-block characters in any truecolor terminal; `sharp` asks
+the terminal at startup for a picture protocol (kitty, sixel, or iTerm2) and
+shows the real image, falling back to pixel art when none is offered or while
+a popup is open. Use `sharp` only in a terminal emulator: a terminal that
+never answers the query delays startup by 2 seconds and swallows the first key.
+An unknown value falls back to `pixel` with a note on stderr.
+
+`RADIO_RECORD_THEME` selects a color theme: `default` (NEON-77: neon cyan,
+magenta, and violet on near-black),
+`amber` (monochrome amber CRT), `phosphor` (green terminal), or `paper`
+(light, for white terminals). An unknown name falls back to `default` with a
+note on stderr. `NO_COLOR` disables colors and takes precedence over the theme.
+
+`RADIO_RECORD_FX` selects how much the interface moves: `full` (default),
+`calm`, or `off`. Motion that follows the audio runs in `full` and `calm`:
+the visualizer's peak caps, the now-playing frame brightening with the bass,
+and the `SIGNAL ACQUIRING` fill that tracks the real buffering percentage.
+Decorative motion runs only in `full`: a new track's title decodes into place
+over about half a second, and `◉ ON AIR` pulses once a second while playing.
+`off` keeps the interface still apart from the visualizer itself. `NO_COLOR`
+caps the mode at `calm`; an unknown value means `full` with a note on stderr.
+
 ## Audio and settings
 
 Native audio uses HTTP (rustls), a pure-Rust AAC-LC decoder (Symphonia),
@@ -361,7 +343,56 @@ Stream priority: `stream_320`, then the AAC-LC variant of `stream_hls`. If a
 stream fails to load, the player tries the next distinct supported URL before
 reporting an error. The HE-AAC `stream_128` and `stream_64` entries are skipped.
 
-## Verify
+## Troubleshooting
+
+**`audio device failed · Enter to retry`** — the native output stream reported
+a fatal error. Press Enter to reopen it. Brief device underruns/overruns,
+automatic audio-route changes, and denied real-time scheduling do not stop
+playback; a brief audio glitch may still be audible.
+
+**`audio device error: ... Sample rate update timed out`** — CoreAudio could
+not finish opening the output while the device format was changing. Press
+Enter to retry. radio-record opens the current hardware rate, including lower-rate
+Bluetooth call formats such as 24 kHz, and resamples radio audio to it. Mono
+output mixes both channels. On macOS the hardware clock is read separately
+from the virtual stream format, so a call's lower rate is preserved. Bluetooth
+headphones can sound less clear while their microphone is active.
+
+**`HE-AAC streams are unsupported · select another station`** — the station
+only offers streams the built-in AAC-LC decoder cannot play. Select a station
+with a direct AAC-LC stream or an AAC-LC HLS variant.
+
+**`<host> unreachable · Enter to retry`** — the player could not open any of
+the station's streams. radio-record falls back from the direct streams to HLS and
+then retries the whole list two more times, 2 seconds apart, before showing
+this; the message names the hosts that failed. The HLS host is a rotating DNS
+pool, so a retry can land on an address that works. A VPN or split-tunnel rule
+that sends some of these addresses around the tunnel is a common cause: route
+`*.hostingradio.ru` and `*.magonet.ru` through the VPN, or check with
+`curl -sI https://radiorecord.hostingradio.ru/rr_main96.aacp`. Other errors
+are shown as `Stream unavailable: <reason>`.
+
+## Build from source
+
+Building from source requires Rust/Cargo. On Linux, also install the ALSA
+headers and pkg-config (`sudo apt install libasound2-dev pkg-config` on
+Debian/Ubuntu). Release binaries need only the ALSA runtime library
+(`libasound.so.2`); macOS uses the built-in CoreAudio framework. HTTP, TLS,
+and AAC decoding are compiled into the binary.
+
+Audio uses the built-in engine: direct AAC-LC streams and the AAC-LC variant
+of HLS. HE-AAC-only stations are unsupported and report a clear error.
+
+The Rust toolchain is pinned in `mise.toml`. With [mise](https://mise.jdx.dev) installed,
+`mise install` in this directory fetches the right `cargo`, `rustfmt`, and `clippy`.
+Any other Rust installation (rustup, distro package) works as well.
+
+```sh
+mise install
+make run
+```
+
+Plain `make` prints help.
 
 ```sh
 make build
@@ -375,9 +406,19 @@ decoded, and the engine pipeline is tested against a null output sink using
 the same callback as the real device. Tests cover long segments, pause and
 resume, stale buffers, station changes, stream fallback, and filtered downsampling. Live
 checks that need the network run with
-`cargo test live_ -- --ignored` (direct stream, HLS, and a short burst on the
-real audio device). The HLS check observes multiple segment publications
+`cargo test live_ -- --ignored` (direct stream, HLS, a Yandex Music lookup, and a
+short burst on the real audio device). The HLS check observes multiple segment publications
 for continuity. `make test-audio` opens the current real output format with
 silent audio and verifies that its hardware rate and channels remain unchanged.
 Account tests use a local HTTP server for login, merge decisions, write
 verification, and request failures; they need no real account.
+
+## Support
+
+If radio-record is useful to you, you can support its development on Ko-fi:
+
+<p align="center">
+  <a href="https://ko-fi.com/isalikov"><img src="https://ko-fi.com/img/githubbutton_sm.svg" alt="Support radio-record on Ko-fi"></a>
+</p>
+
+Bug reports, station suggestions, and small improvements are welcome too.
