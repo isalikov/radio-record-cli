@@ -33,6 +33,10 @@ pub enum PlayerState {
 pub struct Snapshot {
     pub state: PlayerState,
     pub levels: [f64; 2],
+    /// Visualizer columns in 0..1, low to high frequency; empty when silent.
+    pub spectrum: Vec<f32>,
+    /// Falling peak caps above `spectrum`, same length; empty when silent.
+    pub spectrum_peaks: Vec<f32>,
     pub error: Option<String>,
     pub codec: Option<String>,
     pub samplerate: Option<u64>,

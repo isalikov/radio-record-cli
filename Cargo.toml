@@ -1,6 +1,6 @@
 [package]
 name = "radio-record"
-version = "3.0.0"
+version = "3.1.0"
 edition = "2024"
 
 [dependencies]
@@ -25,6 +25,10 @@ symphonia = { version = "0.6", default-features = false, features = ["aac"] }
 cpal = "0.18"
 # Wait-free SPSC ring between the decode thread and the audio callback.
 rtrb = "0.4"
+# Real-input FFT for the spectrum visualizer (pure Rust, on top of rustfft).
+realfft = "3"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+ratatui-image = { version = "11.1", default-features = false, features = ["crossterm"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # Read the hardware clock separately from CoreAudio's virtual stream format.

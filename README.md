@@ -21,9 +21,11 @@
 </p>
 
 Keyboard-only Rust radio player for [Radio Record](https://www.radiorecord.ru/).
-Categories on the left, stations on the right, recent tracks below.
-The accent color marks playback; the alert color marks the selected category
-and favorites.
+The screen is a cyberpunk HUD: a status line on top, then framed panels for
+categories (SECTOR), stations (CHANNELS), and recent tracks (INTERCEPT LOG),
+and a NOW PLAYING window with cover art and a spectrum visualizer at the
+bottom. Neon cyan marks playback; neon magenta marks the selected category,
+favorites, and live badges; acid yellow marks buffering and faults.
 
 ## Run
 
@@ -47,11 +49,34 @@ make run
 
 Plain `make` prints help. Minimum terminal size: 44 × 12. History is hidden in
 short windows to leave room for stations. Truecolor terminals show the full palette.
+Windows at least 21 rows tall show the now-playing panel; 31 rows and more
+give it a larger cover, a metadata line, and a separate telemetry line.
+Shorter windows keep a compact footer with the visualizer above the status
+line. The top line shows the playback state (`◉ ON AIR`, `◉ SYNC 42%`,
+`▮▮ HOLD`, `! FAULT`, or `○ STANDBY`), the favorite count, and uptime.
 
-`RADIO_RECORD_THEME` selects a color theme: `default` (cyan and magenta on dark),
+`RADIO_RECORD_COVER` selects how covers are drawn: `pixel` (default) draws
+pixel art with half-block characters in any truecolor terminal; `sharp` asks
+the terminal at startup for a picture protocol (kitty, sixel, or iTerm2) and
+shows the real image, falling back to pixel art when none is offered or while
+a popup is open. Use `sharp` only in a terminal emulator: a terminal that
+never answers the query delays startup by 2 seconds and swallows the first key.
+An unknown value falls back to `pixel` with a note on stderr.
+
+`RADIO_RECORD_THEME` selects a color theme: `default` (NEON-77: neon cyan,
+magenta, and violet on near-black),
 `amber` (monochrome amber CRT), `phosphor` (green terminal), or `paper`
 (light, for white terminals). An unknown name falls back to `default` with a
 note on stderr. `NO_COLOR` disables colors and takes precedence over the theme.
+
+`RADIO_RECORD_FX` selects how much the interface moves: `full` (default),
+`calm`, or `off`. Motion that follows the audio runs in `full` and `calm`:
+the visualizer's peak caps, the now-playing frame brightening with the bass,
+and the `SIGNAL ACQUIRING` fill that tracks the real buffering percentage.
+Decorative motion runs only in `full`: a new track's title decodes into place
+over about half a second, and `◉ ON AIR` pulses once a second while playing.
+`off` keeps the interface still apart from the visualizer itself. `NO_COLOR`
+caps the mode at `calm`; an unknown value means `full` with a note on stderr.
 
 ## Install
 
@@ -236,17 +261,43 @@ output sample rate, and telemetry. Stalled HLS playlists and repeated corrupt
 segments trigger fallback instead of leaving playback silent indefinitely.
 The `d` diagnostics overlay shows cache fill and underruns.
 
-One smooth bar follows the audio before software gain, riding the louder channel. Its scale
-adapts to the last four seconds of the station's loudness, leaving headroom
-for beats. Attack and release are eased; there is no scrolling, peak marker,
-or synthetic animation. Silence, pause and buffering settle the bar, and mono
-sources mirror the left channel. Physical stroke thickness is determined by
-the terminal font, not an exact pixel size.
+The visualizer shows 96 log-spaced frequency bands from 50 Hz to 14 kHz as
+columns of stacked `▬` pills, bass on the left. Every 50 ms the worker runs a
+4096-point FFT over the mono mix of the audio just heard, before software gain.
+The output callback publishes samples through a fixed ring of atomics, so it
+still never locks or allocates. The window is shifted back by the device's
+reported output latency, so columns move with the sound on Bluetooth outputs
+too. Each band reads FFT bins no other band reads, and each is scaled against
+its own recent range blended with the station's loud moments over the last
+five seconds, so mids and highs move as much as the bass. Wide panels
+interpolate between bands and narrow ones keep each group's maximum; no band
+is drawn twice side by side. Pills shade from cyan at the bottom through
+violet to magenta at the top over a dim resting floor. Columns rise almost
+instantly and fall with accelerating gravity; a cap marks each column's
+recent peak, holds for 0.3 seconds, then falls slowly, glowing yellow near
+the top. Nothing moves without audio. Pause, buffering, stop, and stream
+changes reset it to the resting floor. Pill shape and gaps depend on the
+terminal font.
+
+The now-playing panel takes its window name from the station (`record.sh`,
+or `music.sh` when stopped). Its top border carries a `[LIVE]` badge and a
+ten-step volume meter; its bottom border carries the playback status and,
+while loading or playing, `SIG ▂▃▅▇ BUF 2.4s`, four bars lit by how much of
+the three-second ring is queued. Inside are the track cover, title and
+artist, the genre, station number, and airing time on tall panels, a neon
+progress bar, previous/play-pause/next keys, and the stream format
+(`STREAMING :: AAC/44.1KHZ STEREO/96K`). The visualizer sits beside them at
+full cover height, or below them when the panel is narrow. The keys mirror
+F7/F8/F9; there is no mouse support. Live radio has no track length,
+so the bar shows time since the track started on air and fills against the
+median length of the station's recent tracks; it stays empty until that is
+known. Covers are 200 px images from the history API, fetched once per track;
+a missing cover shows a placeholder note, as does `NO_COLOR`.
 
 Press `d` for a diagnostics overlay: player state and generation, codec, sample
 rate, channels, bitrate, the active stream and its fallback round, cache fill
 and underruns, worker health, history age, uptime, and a sparkline of recent
-levels. The built-in engine measures telemetry in-process. While a stream buffers, the status symbol
+loudness (one smoothed level riding the louder channel). The built-in engine measures telemetry in-process. While a stream buffers, the status symbol
 shows the real cache percentage instead of a bare dot. If the player worker
 stops reporting for two seconds while audio should be alive, the footer shows
 `Player engine stalled · q quit`. The warning clears when the worker resumes

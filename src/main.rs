@@ -1,16 +1,20 @@
 mod account;
 mod api;
 mod app;
+mod cover;
 mod engine;
 mod error;
+mod fx;
 mod json;
 mod media;
 mod player;
 mod settings;
+mod spectrum;
 mod ui;
 
 use api::{Catalog, Client, Track};
 use app::{Action, App};
+use cover::Cover;
 use crossterm::event::{self, Event, KeyEvent, KeyEventKind, KeyModifiers};
 use error::{Error, Result};
 use player::Player;
@@ -52,6 +56,7 @@ struct Network {
     catalog: Option<Receiver<Result<Catalog>>>,
     history: Option<(i64, Receiver<Result<Vec<Track>>>)>,
     history_updated: Instant,
+    cover: Option<(String, Receiver<Result<Cover>>)>,
 }
 
 impl Network {
@@ -61,6 +66,7 @@ impl Network {
             catalog: None,
             history: None,
             history_updated: Instant::now(),
+            cover: None,
         }
     }
     fn catalog(&mut self, app: &mut App) {
@@ -129,6 +135,24 @@ impl Network {
         if self.history.is_none() && self.history_updated.elapsed() >= Duration::from_secs(15) {
             self.history(app);
         }
+        if let Some((url, rx)) = &self.cover {
+            match rx.try_recv() {
+                Ok(result) => {
+                    // A missing cover is cosmetic: the panel draws a placeholder.
+                    app.set_cover(url, result.ok());
+                    self.cover = None;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => self.cover = None,
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        if self.cover.is_none()
+            && let Some(url) = app.wanted_cover().map(str::to_owned)
+        {
+            app.cover_url = Some(url.clone());
+            let job = url.clone();
+            self.cover = Some((url, fetch(move || Cover::fetch(&job))));
+        }
     }
 }
 
@@ -145,8 +169,15 @@ fn run() -> Result<()> {
     network.account.restore(&mut app);
     network.catalog(&mut app);
     let theme = ui::theme_from_env();
+    let sharp_covers = ui::sharp_covers_from_env();
+    app.fx = fx::from_env();
     let mut terminal = ratatui::try_init()?;
     let _guard = TerminalGuard;
+    let mut graphics = if sharp_covers {
+        ui::Graphics::query()
+    } else {
+        ui::Graphics::default()
+    };
     crossterm::execute!(io::stdout(), event::EnableBracketedPaste)?;
     let mut last_frame = Instant::now();
     let mut last_save = Instant::now();
@@ -158,6 +189,9 @@ fn run() -> Result<()> {
         app.generation = player.generation();
         app.set_worker_stalled(player.worker_stalled());
         app.uptime = started.elapsed();
+        app.clock = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_secs() as i64);
         app.history_age = if app.now.is_some() {
             Some(network.history_updated.elapsed())
         } else {
@@ -170,7 +204,7 @@ fn run() -> Result<()> {
         }
         if last_frame.elapsed() >= Duration::from_millis(50) {
             app.push_meter_sample();
-            terminal.draw(|frame| ui::render(frame, &mut app, &theme))?;
+            terminal.draw(|frame| ui::render(frame, &mut app, &theme, &mut graphics))?;
             last_frame = Instant::now();
         }
         if app.dirty && last_save.elapsed() >= Duration::from_millis(500) {
@@ -192,7 +226,7 @@ fn run() -> Result<()> {
                 }
                 Event::Paste(text) => app.account.paste(&text),
                 Event::Resize(_, _) => {
-                    terminal.draw(|frame| ui::render(frame, &mut app, &theme))?;
+                    terminal.draw(|frame| ui::render(frame, &mut app, &theme, &mut graphics))?;
                 }
                 _ => {}
             }

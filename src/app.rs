@@ -4,6 +4,7 @@ use std::{collections::VecDeque, time::Duration};
 
 use crate::{
     api::{Catalog, Station, Stream, Track},
+    cover::Cover,
     player::{PlayerState, Snapshot},
     settings::Settings,
 };
@@ -73,6 +74,26 @@ pub struct App {
     pub loading: bool,
     pub error: Option<String>,
     pub playback: Snapshot,
+    /// Art for the track on air; `cover_url` is the one requested last, so a
+    /// late download for an earlier track is dropped instead of shown.
+    pub cover: Option<Cover>,
+    pub cover_url: Option<String>,
+    /// Wall-clock time (Unix seconds) filled by the main loop, for track progress.
+    pub clock: i64,
+    /// Motion mode, resolved once by the main loop; still (`Off`) in tests.
+    pub fx: crate::fx::Fx,
+    /// When the track on air last changed (`uptime`) and a seed for its
+    /// title decode; set only by `set_history`.
+    pub track_since: Option<(Duration, u64)>,
+}
+
+/// How far the track on air is, from its start time and the station's
+/// recent track lengths. Live radio has no duration, so the fraction is an
+/// estimate and is absent until the history shows a typical length.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Progress {
+    pub elapsed: i64,
+    pub fraction: Option<f64>,
 }
 
 impl App {
@@ -101,7 +122,54 @@ impl App {
             loading: true,
             error: None,
             playback: Snapshot::default(),
+            cover: None,
+            cover_url: None,
+            clock: 0,
+            fx: crate::fx::Fx::Off,
+            track_since: None,
         }
+    }
+
+    /// The cover URL the panel needs but has not requested yet.
+    /// The larger cover is preferred so sharp terminal pictures stay crisp.
+    pub fn wanted_cover(&self) -> Option<&str> {
+        let track = self.history.first()?;
+        let url = [track.image200.as_str(), track.image100.as_str()]
+            .into_iter()
+            .find(|url| url.starts_with("https://") || url.starts_with("http://"))?;
+        (self.cover_url.as_deref() != Some(url)).then_some(url)
+    }
+
+    /// Accept a finished cover download if it is still the one wanted.
+    pub fn set_cover(&mut self, url: &str, cover: Option<Cover>) {
+        if self.cover_url.as_deref() == Some(url) {
+            self.cover = cover;
+        }
+    }
+
+    fn clear_cover(&mut self) {
+        self.cover = None;
+        self.cover_url = None;
+    }
+
+    pub fn progress(&self) -> Option<Progress> {
+        let start = self.history.first().map(|track| track.time)?;
+        let elapsed = self.clock - start;
+        if start <= 0 || !(0..6 * 3600).contains(&elapsed) {
+            return None;
+        }
+        // Median gap between recent track starts, ignoring jingles and shows.
+        let mut lengths: Vec<i64> = self
+            .history
+            .windows(2)
+            .take(12)
+            .map(|pair| pair[0].time - pair[1].time)
+            .filter(|length| (30..=900).contains(length))
+            .collect();
+        lengths.sort_unstable();
+        let fraction = (!lengths.is_empty())
+            .then(|| (elapsed as f64 / lengths[lengths.len() / 2] as f64).min(1.0));
+        Some(Progress { elapsed, fraction })
     }
 
     pub fn set_worker_stalled(&mut self, stalled: bool) {
@@ -197,6 +265,14 @@ impl App {
     pub fn set_history(&mut self, station_id: i64, history: Vec<Track>) {
         if self.now.as_ref().map(|station| station.id) != Some(station_id) {
             return;
+        }
+        let on_air = |track: &Track| (track.time, track.song.clone());
+        let previous = self.history.first().map(on_air);
+        if let Some(current) = history.first().map(on_air)
+            && previous.as_ref() != Some(&current)
+        {
+            let seed = crate::fx::mix(current.0 as u64, station_id as u64, current.1.len() as u64);
+            self.track_since = Some((self.uptime, seed));
         }
         self.history = history;
         self.history_loading = false;
@@ -336,6 +412,7 @@ impl App {
             KeyCode::Char('r') => return Action::Refresh,
             KeyCode::Char('s') => {
                 self.now = None;
+                self.clear_cover();
                 self.history.clear();
                 self.history_error = None;
                 self.history_loading = false;
@@ -398,6 +475,7 @@ impl App {
             return Action::None;
         }
         self.now = Some(station);
+        self.clear_cover();
         self.history.clear();
         self.history_error = None;
         self.history_loading = true;
@@ -649,5 +727,111 @@ pub mod tests {
         app.playback.levels = [0.7, 0.4];
         app.push_meter_sample();
         assert_eq!(*app.meter_history.back().unwrap(), 0.7);
+    }
+
+    pub fn track(time: i64, image: &str) -> Track {
+        Track {
+            id: time,
+            artist: "Artist".into(),
+            song: "Song".into(),
+            image100: image.into(),
+            image200: String::new(),
+            time,
+            time_formatted: String::new(),
+        }
+    }
+
+    #[test]
+    fn progress_follows_the_stations_typical_track_length() {
+        let mut app = fixture();
+        assert_eq!(app.progress(), None);
+        // Tracks started 120, 100 (a jingle gap is ignored), and 110 seconds apart.
+        app.history = vec![
+            track(10_000, ""),
+            track(9_880, ""),
+            track(9_870, ""),
+            track(9_770, ""),
+            track(9_660, ""),
+        ];
+        app.clock = 10_055;
+        let progress = app.progress().unwrap();
+        assert_eq!(progress.elapsed, 55);
+        assert_eq!(progress.fraction, Some(0.5), "median of 100, 110, 120");
+        app.clock = 11_000;
+        assert_eq!(
+            app.progress().unwrap().fraction,
+            Some(1.0),
+            "never past full"
+        );
+        app.history.truncate(1);
+        assert_eq!(
+            app.progress().unwrap().fraction,
+            None,
+            "no typical length yet"
+        );
+        app.clock = 9_000;
+        assert_eq!(
+            app.progress(),
+            None,
+            "a clock behind the start is not progress"
+        );
+        app.history[0].time = 0;
+        assert_eq!(app.progress(), None, "unknown start time");
+    }
+
+    #[test]
+    fn covers_are_requested_once_and_late_downloads_are_dropped() {
+        let mut app = fixture();
+        press(&mut app, KeyCode::Enter);
+        let id = app.now.as_ref().unwrap().id;
+        assert_eq!(app.wanted_cover(), None, "no track yet");
+        app.set_history(id, vec![track(1, "https://example.com/a.jpg")]);
+        assert_eq!(app.wanted_cover(), Some("https://example.com/a.jpg"));
+        app.cover_url = Some("https://example.com/a.jpg".into());
+        assert_eq!(app.wanted_cover(), None, "already requested");
+        app.set_history(id, vec![track(2, "https://example.com/b.jpg")]);
+        app.cover_url = Some("https://example.com/b.jpg".into());
+        let late = crate::cover::tests::cover("https://example.com/a.jpg");
+        app.set_cover("https://example.com/a.jpg", Some(late));
+        assert_eq!(app.cover, None, "the previous track's art must not appear");
+        let fresh = crate::cover::tests::cover("https://example.com/b.jpg");
+        app.set_cover("https://example.com/b.jpg", Some(fresh.clone()));
+        assert_eq!(app.cover, Some(fresh));
+        press(&mut app, KeyCode::Char('s'));
+        assert_eq!((app.cover.as_ref(), app.cover_url.as_ref()), (None, None));
+        app.history = vec![track(3, "data:image/png;base64,AAAA")];
+        assert_eq!(app.wanted_cover(), None, "only http(s) covers are fetched");
+        app.history[0].image200 = "https://example.com/c200.jpg".into();
+        assert_eq!(
+            app.wanted_cover(),
+            Some("https://example.com/c200.jpg"),
+            "the larger cover is preferred"
+        );
+    }
+
+    #[test]
+    fn a_new_track_on_air_starts_its_title_reveal_once() {
+        let mut app = fixture();
+        press(&mut app, KeyCode::Enter);
+        let id = app.now.as_ref().unwrap().id;
+        app.uptime = Duration::from_secs(5);
+        app.set_history(id, vec![track(100, "")]);
+        let (since, seed) = app.track_since.unwrap();
+        assert_eq!(since, Duration::from_secs(5));
+        app.uptime = Duration::from_secs(20);
+        app.set_history(id, vec![track(100, ""), track(40, "")]);
+        assert_eq!(
+            app.track_since,
+            Some((since, seed)),
+            "same track, no replay"
+        );
+        app.set_history(id + 1, vec![track(200, "")]);
+        assert_eq!(
+            app.track_since,
+            Some((since, seed)),
+            "stale station ignored"
+        );
+        app.set_history(id, vec![track(200, ""), track(100, "")]);
+        assert_eq!(app.track_since.unwrap().0, Duration::from_secs(20));
     }
 }

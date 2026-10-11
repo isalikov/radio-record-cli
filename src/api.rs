@@ -367,6 +367,8 @@ pub struct Track {
     pub song: String,
     pub image100: String,
     pub image200: String,
+    /// When the track started on air (Unix seconds); 0 when unknown.
+    pub time: i64,
     pub time_formatted: String,
 }
 
@@ -460,6 +462,10 @@ fn decode_track(value: &JsonValue) -> Result<Track> {
         song: optional_string(value, "song"),
         image100: optional_string(value, "image100"),
         image200: optional_string(value, "image200"),
+        time: value
+            .object_get("time")
+            .and_then(JsonValue::as_i64)
+            .unwrap_or(0),
         time_formatted: optional_string(value, "time_formatted"),
     })
 }
@@ -682,6 +688,7 @@ pub(crate) mod tests {
                 "song": "Test Song",
                 "image100": "",
                 "image200": "",
+                "time": 1791638735,
                 "time_formatted": "12:34:56"
               }
             ]
@@ -694,5 +701,6 @@ pub(crate) mod tests {
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].artist, "Test Artist");
         assert_eq!(history[0].song, "Test Song");
+        assert_eq!(history[0].time, 1791638735);
     }
 }

@@ -2,6 +2,40 @@
 
 All notable changes to this project are documented here.
 
+## [v3.1.0] - 2026-10-11
+
+### Added
+
+- Spectrum visualizer: 48 log-spaced bands drawn as stacked `▬` pill columns,
+  computed from the heard audio with a 2048-point FFT (`realfft`) on the worker
+  thread, compensated for output latency, with auto-gain and gravity release.
+  The audio callback publishes samples through a lock-free ring of atomics.
+- Now-playing panel in windows at least 24 rows tall: station-named title bar
+  with volume, half-block pixel-art cover, title and artist, estimated track
+  progress, and previous/play-pause/next buttons.
+- `RADIO_RECORD_COVER=sharp` shows real cover images through the kitty, sixel,
+  or iTerm2 protocols (`ratatui-image`), falling back to pixel art.
+
+- Cyberpunk HUD: status line with playback state, favorite count, and uptime;
+  heavy notched frames for SECTOR, CHANNELS (with position count and a
+  `◉ LIVE` tag), and INTERCEPT LOG; a NOW PLAYING frame with `[LIVE]`, a
+  volume meter, status, and a buffer signal meter in its borders, plus a
+  metadata line and always-on stream format.
+- NEON-77 default palette with `warn` and `glow` tokens in every theme.
+- `RADIO_RECORD_FX=full|calm|off`: bass-reactive frame glow, peak caps, and a
+  `SIGNAL ACQUIRING` buffering fill; in `full`, a title decode on track change
+  and an ON AIR pulse. `NO_COLOR` caps it at `calm`.
+
+### Changed
+
+- The visualizer replaces the single audio-level bar in the footer; the level
+  remains in the diagnostics sparkline.
+- The visualizer now uses 96 bands from a 4096-point FFT, per-band adaptive
+  scaling, no repeated columns, a cyan-to-magenta gradient, and falling peak
+  caps, so mids and highs move as much as the bass.
+- The now-playing panel drops its blank rows and puts the visualizer beside
+  the cover; the pause symbol is `▮▮` everywhere.
+
 ## [v3.0.0] - 2026-10-09
 
 ### Added

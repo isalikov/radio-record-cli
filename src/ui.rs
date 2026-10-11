@@ -1,19 +1,31 @@
 use crate::{
     account::{Choice, merge},
     app::{App, Category},
+    cover::Cover,
+    fx,
     player::{PlayerState, STREAM_ROUNDS},
 };
 use ratatui::{
     Frame,
+    buffer::Buffer,
     layout::{Constraint, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, Padding, Paragraph},
+    widgets::{Block, BorderType, Borders, Clear, List, ListItem, Padding, Paragraph, Widget},
+};
+use ratatui_image::{
+    Image, Resize,
+    picker::{Picker, ProtocolType},
+    protocol::Protocol,
 };
 use std::{collections::VecDeque, time::Duration};
 
-/// Color palette for the whole UI. `accent` marks playback and live audio,
-/// `alert` marks the selected category, favorites, and errors.
+/// Color palette for the whole UI ("NEON-77" by default). `accent` (neon
+/// cyan) marks playback and live audio, `alert` (neon magenta) the selected
+/// category, favorites, live badges, and errors, `wave` (violet) is the
+/// midpoint of the cyan-to-magenta gradients, `band` fills title tabs and
+/// buttons, `warn` (acid yellow) marks buffering, stalls, and peak caps, and
+/// `glow` is a dim neon used beside bright cells to suggest light bleed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Theme {
     bg: Color,
@@ -23,18 +35,26 @@ pub struct Theme {
     accent: Color,
     alert: Color,
     selected: Color,
+    wave: Color,
+    band: Color,
+    warn: Color,
+    glow: Color,
 }
 
 impl Default for Theme {
     fn default() -> Self {
         Self {
-            bg: Color::Rgb(10, 12, 20),
-            fg: Color::Rgb(216, 222, 239),
-            muted: Color::Rgb(111, 121, 149),
-            edge: Color::Rgb(39, 46, 65),
-            accent: Color::Rgb(53, 235, 221),
-            alert: Color::Rgb(244, 94, 191),
-            selected: Color::Rgb(40, 27, 54),
+            bg: Color::Rgb(7, 7, 13),
+            fg: Color::Rgb(232, 228, 255),
+            muted: Color::Rgb(108, 104, 147),
+            edge: Color::Rgb(43, 36, 69),
+            accent: Color::Rgb(0, 240, 255),
+            alert: Color::Rgb(255, 42, 109),
+            selected: Color::Rgb(42, 15, 51),
+            wave: Color::Rgb(157, 77, 255),
+            band: Color::Rgb(19, 17, 31),
+            warn: Color::Rgb(252, 238, 10),
+            glow: Color::Rgb(11, 58, 68),
         }
     }
 }
@@ -50,6 +70,10 @@ impl Theme {
             accent: Color::Rgb(255, 213, 79),
             alert: Color::Rgb(255, 236, 189),
             selected: Color::Rgb(66, 38, 0),
+            wave: Color::Rgb(214, 140, 20),
+            band: Color::Rgb(48, 28, 0),
+            warn: Color::Rgb(255, 241, 194),
+            glow: Color::Rgb(58, 36, 0),
         }
     }
 
@@ -63,6 +87,10 @@ impl Theme {
             accent: Color::Rgb(150, 255, 180),
             alert: Color::Rgb(200, 255, 214),
             selected: Color::Rgb(8, 52, 20),
+            wave: Color::Rgb(60, 200, 100),
+            band: Color::Rgb(6, 34, 14),
+            warn: Color::Rgb(232, 255, 176),
+            glow: Color::Rgb(10, 58, 24),
         }
     }
 
@@ -73,9 +101,13 @@ impl Theme {
             fg: Color::Rgb(52, 49, 44),
             muted: Color::Rgb(132, 127, 117),
             edge: Color::Rgb(213, 208, 196),
-            accent: Color::Rgb(0, 128, 128),
-            alert: Color::Rgb(196, 22, 118),
+            accent: Color::Rgb(0, 124, 134),
+            alert: Color::Rgb(196, 22, 111),
             selected: Color::Rgb(228, 225, 242),
+            wave: Color::Rgb(110, 70, 190),
+            band: Color::Rgb(234, 231, 220),
+            warn: Color::Rgb(154, 107, 0),
+            glow: Color::Rgb(217, 240, 242),
         }
     }
 
@@ -89,6 +121,30 @@ impl Theme {
             accent: Color::Reset,
             alert: Color::Reset,
             selected: Color::Reset,
+            wave: Color::Reset,
+            band: Color::Reset,
+            warn: Color::Reset,
+            glow: Color::Reset,
+        }
+    }
+
+    /// False for the `NO_COLOR` palette, where pictures cannot be drawn.
+    fn colorful(&self) -> bool {
+        self.bg != Color::Reset
+    }
+
+    /// The neon gradient at `t` in 0..1: accent, then wave, then alert.
+    /// Without RGB colors it degrades to the nearest stop.
+    fn gradient(&self, t: f32) -> Color {
+        let t = if t.is_finite() {
+            t.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        if t < 0.5 {
+            mix(self.accent, self.wave, t * 2.0)
+        } else {
+            mix(self.wave, self.alert, (t - 0.5) * 2.0)
         }
     }
 
@@ -112,6 +168,19 @@ impl Theme {
     }
 }
 
+/// Linear blend of two RGB colors; anything else snaps to the nearer one.
+fn mix(from: Color, to: Color, t: f32) -> Color {
+    match (from, to) {
+        (Color::Rgb(r1, g1, b1), Color::Rgb(r2, g2, b2)) => {
+            let blend =
+                |a: u8, b: u8| (f32::from(a) + (f32::from(b) - f32::from(a)) * t).round() as u8;
+            Color::Rgb(blend(r1, r2), blend(g1, g2), blend(b1, b2))
+        }
+        _ if t < 0.5 => from,
+        _ => to,
+    }
+}
+
 /// Resolve the startup theme from `RADIO_RECORD_THEME` and `NO_COLOR`. An unknown
 /// name falls back to the default theme with a note on stderr. Called once at
 /// startup, before the terminal takes over the screen.
@@ -125,7 +194,75 @@ pub fn theme_from_env() -> Theme {
     Theme::resolve(no_color, Some(name))
 }
 
-pub fn render(frame: &mut Frame, app: &mut App, theme: &Theme) {
+/// Cover drawing mode from `RADIO_RECORD_COVER`: `pixel` (default) draws
+/// half-block pixel art everywhere; `sharp` asks the terminal for a picture
+/// protocol (kitty, sixel, iTerm2). Read before the terminal takes over.
+pub fn sharp_covers_from_env() -> bool {
+    let value = std::env::var("RADIO_RECORD_COVER").unwrap_or_default();
+    match value.trim() {
+        "sharp" => true,
+        "" | "pixel" => false,
+        other => {
+            eprintln!("radio-record: unknown RADIO_RECORD_COVER '{other}', using pixel");
+            false
+        }
+    }
+}
+
+/// Terminal picture support for sharp covers. Without a picker (the default,
+/// and in tests) every cover is drawn in half-blocks by `CoverArt`.
+#[derive(Default)]
+pub struct Graphics {
+    picker: Option<Picker>,
+    /// The encoded picture for one cover URL at one size; rebuilt only when
+    /// either changes, never per frame.
+    cached: Option<(String, Rect, Protocol)>,
+}
+
+impl Graphics {
+    /// Ask the terminal which picture protocol it speaks. Must run after the
+    /// alternate screen is entered and before any terminal event is read, or
+    /// the event reader swallows the reply. Half-block-only terminals keep
+    /// the built-in pixel art.
+    pub fn query() -> Self {
+        let picker = Picker::from_query_stdio()
+            .ok()
+            .filter(|picker| picker.protocol_type() != ProtocolType::Halfblocks);
+        Self {
+            picker,
+            cached: None,
+        }
+    }
+
+    /// Draw `cover` as a real picture if the terminal can. Returns false when
+    /// the caller should fall back to half-blocks.
+    fn draw(&mut self, frame: &mut Frame, cover: &Cover, area: Rect) -> bool {
+        let Some(picker) = &self.picker else {
+            return false;
+        };
+        let fresh = self
+            .cached
+            .as_ref()
+            .is_some_and(|(url, cached, _)| *url == cover.url && *cached == area);
+        if !fresh {
+            let image = image::DynamicImage::ImageRgb8(cover.image.clone());
+            let filter = image::imageops::FilterType::Triangle;
+            self.cached = picker
+                .new_protocol(image, area.as_size(), Resize::Fit(Some(filter)))
+                .ok()
+                .map(|protocol| (cover.url.clone(), area, protocol));
+        }
+        match &self.cached {
+            Some((_, _, protocol)) if protocol.needs_placeholder(area).is_none() => {
+                frame.render_widget(Image::new(protocol), area);
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+pub fn render(frame: &mut Frame, app: &mut App, theme: &Theme, graphics: &mut Graphics) {
     let area = frame.area();
     frame.render_widget(
         Block::default().style(Style::default().bg(theme.bg).fg(theme.fg)),
@@ -138,13 +275,22 @@ pub fn render(frame: &mut Frame, app: &mut App, theme: &Theme) {
         );
         return;
     }
-    let [body, footer] = Layout::vertical([Constraint::Min(1), Constraint::Length(4)])
-        .areas(area.inner(Margin::new(2, 1)));
+    let [header_area, inner] = Layout::vertical([Constraint::Length(1), Constraint::Min(1)])
+        .areas(area.inner(Margin::new(1, 0)));
+    header(frame, app, header_area, theme);
+    let panel = Panel::fit(inner.height, inner.width);
+    let footer_height = match panel {
+        Some(panel) => panel.height(),
+        // Small terminals keep the compact footer: visualizer row(s) + 3 lines.
+        None if area.height >= 20 => 5,
+        None => 4,
+    };
+    let [body, footer] =
+        Layout::vertical([Constraint::Min(1), Constraint::Length(footer_height)]).areas(inner);
     let category_width = if area.width >= 90 { 25 } else { 18 };
     let [sidebar, right] =
         Layout::horizontal([Constraint::Length(category_width), Constraint::Min(1)]).areas(body);
     categories(frame, app, sidebar, theme);
-    let right = right.inner(Margin::new(1, 0));
     if app.show_history && body.height >= 12 {
         let [stations_area, history_area] = Layout::vertical([
             Constraint::Min(6),
@@ -156,7 +302,10 @@ pub fn render(frame: &mut Frame, app: &mut App, theme: &Theme) {
     } else {
         stations(frame, app, right, theme);
     }
-    playback(frame, app, footer, theme);
+    match panel {
+        Some(panel) => now_playing(frame, app, footer, panel, theme, graphics),
+        None => playback(frame, app, footer.inner(Margin::new(1, 0)), theme),
+    }
     if app.help {
         help(frame, area, app.help_scroll, theme);
     }
@@ -168,19 +317,86 @@ pub fn render(frame: &mut Frame, app: &mut App, theme: &Theme) {
     }
 }
 
-fn panel<'a>(title: &'a str, theme: &Theme) -> Block<'a> {
+/// A HUD frame: heavy borders with the title notched into the top edge,
+/// as in `┏━ // CHANNELS ━━━ 09/112 ━┓`.
+fn hud<'a>(label: &'a str, theme: &Theme) -> Block<'a> {
     Block::default()
-        .title(Line::from(Span::styled(
-            title,
-            Style::default().fg(theme.muted),
-        )))
-        .borders(Borders::TOP)
+        .borders(Borders::ALL)
+        .border_type(BorderType::Thick)
         .border_style(Style::default().fg(theme.edge))
-        .padding(Padding::new(0, 0, 0, 0))
+        .title(Line::from(vec![
+            Span::styled("━ ", Style::default().fg(theme.edge)),
+            Span::styled("// ", Style::default().fg(theme.muted)),
+            Span::styled(label, Style::default().fg(theme.fg)),
+            Span::raw(" "),
+        ]))
+}
+
+/// A notch on the right end of a HUD border: ` text ━`.
+fn notch(spans: Vec<Span<'static>>, theme: &Theme) -> Line<'static> {
+    let mut line = vec![Span::raw(" ")];
+    line.extend(spans);
+    line.push(Span::styled(" ━", Style::default().fg(theme.edge)));
+    Line::from(line).right_aligned()
+}
+
+/// The top line: the screen title and machine state, all from real data.
+fn header(frame: &mut Frame, app: &App, area: Rect, theme: &Theme) {
+    // The one continuous decoration: a slow pulse while on air.
+    let on_air = if app.fx.decorative() && !fx::blink(app.uptime, fx::PULSE) {
+        mix(theme.alert, theme.bg, 0.55)
+    } else {
+        theme.alert
+    };
+    let (pill, color) = match app.playback.state {
+        PlayerState::Playing => ("◉ ON AIR".to_owned(), on_air),
+        PlayerState::Buffering => (
+            format!("◉ SYNC {}%", app.playback.buffering.unwrap_or(0)),
+            theme.warn,
+        ),
+        PlayerState::Paused => ("▮▮ HOLD".to_owned(), theme.muted),
+        PlayerState::Error => ("! FAULT".to_owned(), theme.warn),
+        PlayerState::Idle => ("○ STANDBY".to_owned(), theme.muted),
+    };
+    let dot = || Span::styled(" ▪ ", Style::default().fg(theme.edge));
+    let right = Line::from(vec![
+        Span::raw(" "),
+        Span::styled(pill, Style::default().fg(color)),
+        dot(),
+        Span::styled(
+            format!("{} FAV", app.settings.favorites.len()),
+            Style::default().fg(theme.muted),
+        ),
+        dot(),
+        Span::styled(
+            format!("UP {}", uptime_text(app.uptime)),
+            Style::default().fg(theme.muted),
+        ),
+        Span::styled(" ◣", Style::default().fg(theme.alert)),
+    ]);
+    let left = Line::from(vec![
+        Span::styled("◢ ", Style::default().fg(theme.alert)),
+        Span::styled(
+            "RADIO",
+            Style::default().fg(theme.fg).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("//", Style::default().fg(theme.alert)),
+        Span::styled(
+            "RECORD ",
+            Style::default().fg(theme.fg).add_modifier(Modifier::BOLD),
+        ),
+    ]);
+    let rule = usize::from(area.width).saturating_sub(left.width() + right.width());
+    let mut spans = left.spans;
+    spans.push(Span::styled(
+        "━".repeat(rule),
+        Style::default().fg(theme.edge),
+    ));
+    spans.extend(right.spans);
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn categories(frame: &mut Frame, app: &mut App, area: Rect, theme: &Theme) {
-    let [area, hint] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(area);
     let label = app
         .account
         .session
@@ -196,14 +412,14 @@ fn categories(frame: &mut Frame, app: &mut App, area: Rect, theme: &Theme) {
     } else {
         ""
     };
-    let state = format!("a {label}{suffix}");
-    frame.render_widget(
-        Paragraph::new(state).style(Style::default().fg(theme.muted)),
-        hint,
-    );
-    let block = panel("", theme)
-        .borders(Borders::RIGHT)
-        .padding(Padding::new(0, 1, 0, 0));
+    let block = hud("SECTOR", theme).title_bottom(Line::from(vec![
+        Span::styled("━ ", Style::default().fg(theme.edge)),
+        Span::styled("a ", Style::default().fg(theme.accent)),
+        Span::styled(
+            format!("{label}{suffix} "),
+            Style::default().fg(theme.muted),
+        ),
+    ]));
     let items: Vec<_> = app
         .categories
         .iter()
@@ -223,16 +439,24 @@ fn categories(frame: &mut Frame, app: &mut App, area: Rect, theme: &Theme) {
         List::new(items)
             .block(block)
             .highlight_style(selected)
-            .highlight_symbol("▏"),
+            .highlight_symbol("▌"),
         area,
         &mut app.category,
     );
 }
 
 fn stations(frame: &mut Frame, app: &mut App, area: Rect, theme: &Theme) {
-    let block = panel("", theme).borders(Borders::NONE);
-    let inner = block.inner(area);
     let visible = app.visible();
+    let count = format!(
+        "{:02}/{:02}",
+        app.stations.selected().map_or(0, |index| index + 1),
+        visible.len()
+    );
+    let block = hud("CHANNELS", theme).title(notch(
+        vec![Span::styled(count, Style::default().fg(theme.muted))],
+        theme,
+    ));
+    let inner = block.inner(area);
     if visible.is_empty() {
         let text = if app.loading {
             "Loading…"
@@ -250,6 +474,8 @@ fn stations(frame: &mut Frame, app: &mut App, area: Rect, theme: &Theme) {
         );
         return;
     }
+    // One column goes to the highlight symbol.
+    let width = usize::from(inner.width.saturating_sub(1));
     let items: Vec<_> = visible
         .iter()
         .map(|station| {
@@ -257,14 +483,14 @@ fn stations(frame: &mut Frame, app: &mut App, area: Rect, theme: &Theme) {
                 && !matches!(app.playback.state, PlayerState::Idle | PlayerState::Error);
             let marker = if is_current {
                 match app.playback.state {
-                    PlayerState::Paused => "Ⅱ ",
-                    PlayerState::Buffering => "· ",
-                    _ => "▶ ",
+                    PlayerState::Paused => "▮▮ ",
+                    PlayerState::Buffering => "·  ",
+                    _ => "▶  ",
                 }
             } else {
-                "  "
+                "   "
             };
-            let line = Line::from(vec![
+            let mut spans = vec![
                 Span::styled(marker, Style::default().fg(theme.accent)),
                 Span::styled(
                     station.title.clone(),
@@ -286,22 +512,31 @@ fn stations(frame: &mut Frame, app: &mut App, area: Rect, theme: &Theme) {
                     },
                     Style::default().fg(theme.alert),
                 ),
-            ]);
-            ListItem::new(line)
+            ];
+            if is_current && app.playback.state == PlayerState::Playing {
+                let tag = "◉ LIVE ";
+                let used: usize = spans.iter().map(Span::width).sum();
+                if used + tag.chars().count() < width {
+                    let gap = width - used - tag.chars().count();
+                    spans.push(Span::raw(" ".repeat(gap)));
+                    spans.push(Span::styled(tag, Style::default().fg(theme.alert)));
+                }
+            }
+            ListItem::new(Line::from(spans))
         })
         .collect();
     frame.render_stateful_widget(
         List::new(items)
             .block(block)
             .highlight_style(Style::default().bg(theme.selected))
-            .highlight_symbol("▏"),
+            .highlight_symbol("▌"),
         area,
         &mut app.stations,
     );
 }
 
 fn history(frame: &mut Frame, app: &mut App, area: Rect, theme: &Theme) {
-    let block = panel("History ", theme);
+    let block = hud("INTERCEPT LOG", theme);
     let inner = block.inner(area);
     if app.history.len() <= 1 {
         let text = if let Some(error) = &app.history_error {
@@ -327,14 +562,13 @@ fn history(frame: &mut Frame, app: &mut App, area: Rect, theme: &Theme) {
         .map(|track| {
             ListItem::new(Line::from(vec![
                 Span::styled(
-                    format!("{}  ", track.time_formatted),
+                    format!(" {} ", track.time_formatted),
                     Style::default().fg(theme.muted),
                 ),
+                Span::styled(">> ", Style::default().fg(theme.edge)),
                 Span::styled(track.artist.clone(), Style::default().fg(theme.fg)),
-                Span::styled(
-                    format!(" — {}", track.song),
-                    Style::default().fg(theme.muted),
-                ),
+                Span::styled(" :: ", Style::default().fg(theme.edge)),
+                Span::styled(track.song.clone(), Style::default().fg(theme.muted)),
             ]))
         })
         .collect();
@@ -347,50 +581,26 @@ fn history(frame: &mut Frame, app: &mut App, area: Rect, theme: &Theme) {
     }
 }
 
-fn playback(frame: &mut Frame, app: &App, mut area: Rect, theme: &Theme) {
-    let playing = app.playback.state == PlayerState::Playing;
-    // One bar, riding the louder channel; mono sources mirror the left one.
-    let level = if playing {
-        app.playback.levels[0].max(app.playback.levels[1])
-    } else {
-        0.0
-    };
+/// The footer: the spectrum visualizer on top, then status, track, and the
+/// global error on the last three rows.
+fn playback(frame: &mut Frame, app: &App, area: Rect, theme: &Theme) {
+    let rows = area.height.saturating_sub(3).max(1);
     frame.render_widget(
-        Paragraph::new(meter(area.width, level, theme)),
-        Rect::new(area.x, area.y, area.width, 1),
+        Visualizer::new(spectrum_levels(app), theme),
+        Rect::new(area.x, area.y, area.width, rows),
     );
-    area.y += 1;
-    let area = Rect::new(area.x, area.y, area.width, area.height - 1);
+    let area = Rect::new(
+        area.x,
+        area.y + rows,
+        area.width,
+        area.height.saturating_sub(rows),
+    );
+    if area.height < 3 {
+        return;
+    }
     let [status, volume] = Layout::horizontal([Constraint::Min(1), Constraint::Length(5)])
         .areas(Rect::new(area.x, area.y, area.width, 1));
-    let symbol = match app.playback.state {
-        PlayerState::Idle => "○".to_owned(),
-        // Real cache progress while the stream fills; a bare dot until the engine reports progress.
-        PlayerState::Buffering => match app.playback.buffering {
-            Some(percent) => format!("· {percent}%"),
-            None => "·".to_owned(),
-        },
-        PlayerState::Playing => "▶".to_owned(),
-        PlayerState::Paused => "Ⅱ".to_owned(),
-        PlayerState::Error => "!".to_owned(),
-    };
-    let name = app
-        .now
-        .as_ref()
-        .map(|station| station.title.as_str())
-        .unwrap_or("Stopped");
-    let mut spans = vec![Span::styled(
-        format!("{symbol}  {name}"),
-        Style::default().fg(theme.accent),
-    )];
-    if app.show_diag {
-        for segment in telemetry_segments(app) {
-            spans.push(Span::styled(
-                format!(" · {segment}"),
-                Style::default().fg(theme.muted),
-            ));
-        }
-    }
+    let spans = status_spans(app, theme);
     frame.render_widget(Paragraph::new(Line::from(spans)), status);
     frame.render_widget(
         Paragraph::new(format!("{}%", app.settings.volume))
@@ -420,6 +630,40 @@ fn playback(frame: &mut Frame, app: &App, mut area: Rect, theme: &Theme) {
         Paragraph::new(status).style(Style::default().fg(theme.alert)),
         Rect::new(area.x, area.y + 2, area.width, 1),
     );
+}
+
+/// The playback state symbol and station name, plus telemetry segments while
+/// the diagnostics overlay is open.
+fn status_spans(app: &App, theme: &Theme) -> Vec<Span<'static>> {
+    let symbol = match app.playback.state {
+        PlayerState::Idle => "○".to_owned(),
+        // Real cache progress while the stream fills; a bare dot until the engine reports progress.
+        PlayerState::Buffering => match app.playback.buffering {
+            Some(percent) => format!("· {percent}%"),
+            None => "·".to_owned(),
+        },
+        PlayerState::Playing => "▶".to_owned(),
+        PlayerState::Paused => "▮▮".to_owned(),
+        PlayerState::Error => "!".to_owned(),
+    };
+    let name = app
+        .now
+        .as_ref()
+        .map(|station| station.title.as_str())
+        .unwrap_or("Stopped");
+    let mut spans = vec![Span::styled(
+        format!("{symbol}  {name}"),
+        Style::default().fg(theme.accent),
+    )];
+    if app.show_diag {
+        for segment in telemetry_segments(app) {
+            spans.push(Span::styled(
+                format!(" · {segment}"),
+                Style::default().fg(theme.muted),
+            ));
+        }
+    }
+    spans
 }
 
 /// Segments shown after the station name while the diagnostics overlay is open.
@@ -519,41 +763,590 @@ fn sparkline(history: &VecDeque<f64>, width: usize) -> String {
         .collect()
 }
 
-// One thin stroke following the current audio level. The percentile
-// normalization and attack/release easing upstream make the motion smooth;
-// there is no history, scrolling, or peak marker here. The terminal's font
-// determines the physical stroke thickness.
-fn meter(width: u16, level: f64, theme: &Theme) -> Line<'static> {
-    let level = if level.is_finite() {
-        level.clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
-    let active = (level * f64::from(width)).round() as usize;
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    let mut run = String::new();
-    let mut run_style = Style::default();
-    for index in 0..usize::from(width) {
-        let style = if index < active {
-            Style::default().fg(theme.accent)
-        } else {
-            Style::default().fg(theme.edge)
+/// Size of the now-playing panel: a heavy frame with the status notched
+/// into its borders, the cover beside the track details, and the visualizer
+/// beside them at full cover height (or below them when the panel is narrow).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Panel {
+    cover_rows: u16,
+    /// Visualizer rows under the cover; zero when it sits beside the details.
+    below_rows: u16,
+}
+
+/// The details column never shrinks below this; the side visualizer needs
+/// at least `SIDE_VISUALIZER` columns or moves below.
+const DETAILS_MIN: u16 = 36;
+const DETAILS_MAX: u16 = 56;
+const SIDE_VISUALIZER: u16 = 16;
+
+impl Panel {
+    /// The largest panel that still leaves the station list room, if any.
+    fn fit(height: u16, width: u16) -> Option<Self> {
+        let cover_rows = match height {
+            30.. => 7,
+            20.. => 5,
+            _ => return None,
         };
-        let symbol = "─";
-        if run_style == style && !run.is_empty() {
-            run.push_str(symbol);
-        } else {
-            if !run.is_empty() {
-                spans.push(Span::styled(std::mem::take(&mut run), run_style));
-            }
-            run_style = style;
-            run.push_str(symbol);
+        // Borders, a padding column, the cover, gaps, details, visualizer.
+        let side = width >= 2 + 1 + cover_rows * 2 + 2 + DETAILS_MIN + 2 + SIDE_VISUALIZER;
+        Some(Self {
+            cover_rows,
+            below_rows: if side { 0 } else { 2 },
+        })
+    }
+
+    fn height(self) -> u16 {
+        2 + self.cover_rows + self.below_rows
+    }
+
+    /// Room for a metadata line and a telemetry line of their own.
+    fn roomy(self) -> bool {
+        self.cover_rows >= 7
+    }
+}
+
+fn now_playing(
+    frame: &mut Frame,
+    app: &App,
+    area: Rect,
+    panel: Panel,
+    theme: &Theme,
+    graphics: &mut Graphics,
+) {
+    let edge = Style::default().fg(theme.edge);
+    // The frame breathes with the bass: six steps from edge toward accent,
+    // so a steady level repaints nothing.
+    let glow = if app.fx.reactive() {
+        let (levels, _) = spectrum_levels(app);
+        let bass = levels.iter().take(12).copied().fold(0.0, f32::max);
+        mix(
+            theme.edge,
+            theme.accent,
+            (bass.clamp(0.0, 1.0) * 6.0).floor() / 6.0 * 0.8,
+        )
+    } else {
+        theme.edge
+    };
+    let mut top = vec![
+        Span::styled("━", edge),
+        Span::styled("▌", Style::default().fg(theme.accent)),
+        Span::styled(
+            " NOW PLAYING ",
+            Style::default()
+                .fg(theme.fg)
+                .bg(theme.band)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("▐", Style::default().fg(theme.accent)),
+        Span::styled("━ ", edge),
+        Span::styled("♫ ", Style::default().fg(theme.wave)),
+        Span::styled(window_title(app), Style::default().fg(theme.fg)),
+        Span::raw(" "),
+    ];
+    if app.playback.state == PlayerState::Playing {
+        top.push(Span::styled("[LIVE] ", Style::default().fg(theme.alert)));
+    }
+    let mut bottom = vec![Span::styled("━ ", edge)];
+    bottom.extend(status_spans(app, theme));
+    bottom.push(Span::raw(" "));
+    let mut block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Thick)
+        .border_style(Style::default().fg(glow))
+        .title(Line::from(top))
+        .title(notch(volume_meter(app.settings.volume, theme), theme))
+        .title_bottom(Line::from(bottom));
+    let signal = signal(app, theme);
+    if !signal.is_empty() {
+        block = block.title_bottom(notch(signal, theme));
+    }
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.is_empty() {
+        return;
+    }
+    let cover =
+        Rect::new(inner.x + 1, inner.y, panel.cover_rows * 2, panel.cover_rows).intersection(inner);
+    // Terminal pictures sit above the text layer, so popups would not cover
+    // them: any open overlay switches back to half-blocks, which it can cover.
+    let overlay = app.help || app.show_diag || app.account.open;
+    let sharp = match &app.cover {
+        Some(art) if theme.colorful() && !overlay => graphics.draw(frame, art, cover),
+        _ => false,
+    };
+    if !sharp {
+        frame.render_widget(CoverArt::new(app.cover.as_ref(), theme), cover);
+    }
+    let text_x = cover.right() + 2;
+    let room = inner.right().saturating_sub(text_x + 1);
+    let (details_width, visualizer) = if panel.below_rows == 0 {
+        let width = room
+            .saturating_sub(2 + SIDE_VISUALIZER)
+            .clamp(DETAILS_MIN.min(room), DETAILS_MAX);
+        let x = text_x + width + 2;
+        (
+            width,
+            Rect::new(
+                x,
+                inner.y,
+                inner.right().saturating_sub(x + 1),
+                panel.cover_rows,
+            ),
+        )
+    } else {
+        (
+            room,
+            Rect::new(
+                inner.x + 1,
+                inner.y + panel.cover_rows,
+                inner.width.saturating_sub(2),
+                panel.below_rows,
+            ),
+        )
+    };
+    let details_area =
+        Rect::new(text_x, inner.y, details_width, panel.cover_rows).intersection(inner);
+    frame.render_widget(
+        Paragraph::new(details(app, details_area.width, panel, theme)),
+        details_area,
+    );
+    let visualizer = visualizer.intersection(inner);
+    match app.playback.buffering {
+        Some(percent) if app.playback.state == PlayerState::Buffering && app.fx.reactive() => {
+            let sweep = app.fx.decorative().then_some(app.uptime);
+            frame.render_widget(Acquire::new(percent, sweep, theme), visualizer);
+        }
+        _ => frame.render_widget(Visualizer::new(spectrum_levels(app), theme), visualizer),
+    }
+}
+
+/// While a stream buffers, the visualizer area shows the real fill toward
+/// playback: `SIGNAL ACQUIRING 42%` over a row of warning pills. In full
+/// motion a bright head sweeps across the filled part; the fill itself only
+/// ever moves with the buffer.
+struct Acquire<'a> {
+    percent: u8,
+    sweep: Option<Duration>,
+    theme: &'a Theme,
+}
+
+impl<'a> Acquire<'a> {
+    fn new(percent: u8, sweep: Option<Duration>, theme: &'a Theme) -> Self {
+        Self {
+            percent: percent.min(100),
+            sweep,
+            theme,
         }
     }
-    if !run.is_empty() {
-        spans.push(Span::styled(run, run_style));
+}
+
+impl Widget for Acquire<'_> {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        if area.is_empty() {
+            return;
+        }
+        let theme = self.theme;
+        let columns = area.width.div_ceil(2);
+        let lit = (u32::from(columns) * u32::from(self.percent) / 100) as u16;
+        let head = self
+            .sweep
+            .filter(|_| lit > 0)
+            .map(|now| ((now.as_millis() / 60) % u128::from(lit)) as u16);
+        let bottom = area.bottom() - 1;
+        for column in 0..columns {
+            let color = if Some(column) == head {
+                theme.fg
+            } else if column < lit {
+                theme.warn
+            } else {
+                theme.glow
+            };
+            buf[(area.x + column * 2, bottom)]
+                .set_symbol("▬")
+                .set_fg(color);
+        }
+        if area.height >= 2 {
+            let label = format!("SIGNAL ACQUIRING {}%", self.percent);
+            let y = area.y + (area.height - 1) / 2;
+            buf.set_stringn(
+                area.x,
+                y,
+                &label,
+                usize::from(area.width),
+                Style::default().fg(theme.warn).add_modifier(Modifier::BOLD),
+            );
+        }
+    }
+}
+
+/// `VOL ━━━─────── 30%`: ten cells shading cyan to magenta as volume rises.
+fn volume_meter(volume: u8, theme: &Theme) -> Vec<Span<'static>> {
+    let filled = usize::from(volume.min(100)).div_ceil(10);
+    let mut spans = vec![Span::styled("VOL ", Style::default().fg(theme.muted))];
+    for cell in 0..10 {
+        spans.push(if cell < filled {
+            Span::styled("━", Style::default().fg(theme.gradient(cell as f32 / 9.0)))
+        } else {
+            Span::styled("─", Style::default().fg(theme.edge))
+        });
+    }
+    spans.push(Span::styled(
+        format!(" {volume}%"),
+        Style::default().fg(theme.muted),
+    ));
+    spans
+}
+
+/// `SIG ▂▃▅▇ BUF 2.4s`: four bars lit by how much audio is queued, out of
+/// the ring's three seconds. Absent when nothing is loading or playing.
+fn signal(app: &App, theme: &Theme) -> Vec<Span<'static>> {
+    let Some(seconds) = app
+        .playback
+        .cache_seconds
+        .filter(|seconds| seconds.is_finite())
+    else {
+        return Vec::new();
+    };
+    let lit = ((seconds / 3.0 * 4.0).ceil() as usize).min(4);
+    let on = if app.playback.state == PlayerState::Buffering {
+        theme.warn
+    } else {
+        theme.accent
+    };
+    let mut spans = vec![Span::styled("SIG ", Style::default().fg(theme.muted))];
+    for (index, bar) in ["▂", "▃", "▅", "▇"].into_iter().enumerate() {
+        spans.push(Span::styled(
+            bar,
+            Style::default().fg(if index < lit { on } else { theme.edge }),
+        ));
+    }
+    spans.push(Span::styled(
+        format!(" BUF {seconds:.1}s"),
+        Style::default().fg(theme.muted),
+    ));
+    spans
+}
+
+/// The panel's window title, a shell-script name after the station on air.
+fn window_title(app: &App) -> String {
+    let name = app
+        .now
+        .as_ref()
+        .map(|station| station.prefix.trim())
+        .filter(|prefix| !prefix.is_empty())
+        .unwrap_or("music");
+    format!("{name}.sh")
+}
+
+/// Title, artist, metadata, progress, transport buttons, telemetry, and
+/// errors beside the cover. Status and volume live in the panel's borders.
+fn details(app: &App, width: u16, panel: Panel, theme: &Theme) -> Vec<Line<'static>> {
+    let (title, artist) = match app.history.first() {
+        Some(track) => (track.song.clone(), track.artist.clone()),
+        None => (
+            app.now
+                .as_ref()
+                .map_or("Stopped", |station| station.title.as_str())
+                .to_owned(),
+            if app.history_loading {
+                "Loading track…".to_owned()
+            } else {
+                String::new()
+            },
+        ),
+    };
+    let bold = Style::default().fg(theme.fg).add_modifier(Modifier::BOLD);
+    // A new track decodes into place with a typing cursor; then it is still.
+    let reveal = app
+        .track_since
+        .filter(|_| app.fx.decorative() && !app.history.is_empty())
+        .and_then(|(since, seed)| {
+            fx::progress(app.uptime, since, fx::REVEAL).map(|progress| (progress, seed))
+        });
+    let title = match reveal {
+        Some((progress, seed)) => Line::from(vec![
+            Span::styled(fx::scramble(&title, progress, seed), bold),
+            Span::styled("█", Style::default().fg(theme.accent)),
+        ]),
+        None => Line::styled(title, bold),
+    };
+    let mut lines = vec![
+        title,
+        Line::styled(artist, Style::default().fg(theme.muted)),
+    ];
+    if panel.roomy() {
+        lines.push(metadata_line(app, theme));
+    }
+    lines.push(progress_line(app, width, theme));
+    let mut transport = buttons(app, theme);
+    let telemetry = telemetry_line(app, theme);
+    if panel.roomy() {
+        lines.push(Line::from(transport));
+        lines.push(telemetry);
+    } else {
+        // Narrow panels keep only the values: `AAC/44.1KHZ STEREO/96K`.
+        transport.push(Span::raw("  "));
+        transport.extend(telemetry.spans.into_iter().skip(2));
+        lines.push(Line::from(transport));
+    }
+    let error = app.playback.error.as_deref().or(app.error.as_deref());
+    lines.push(Line::styled(
+        error.unwrap_or("").to_owned(),
+        Style::default().fg(theme.alert),
+    ));
+    lines
+}
+
+/// `TRANCE ▪ CH-061 ▪ AIRED 16:31:26`: genre, station id, and track start.
+fn metadata_line(app: &App, theme: &Theme) -> Line<'static> {
+    let mut parts = Vec::new();
+    if let Some(station) = &app.now {
+        if let Some(genre) = station.genres.first() {
+            parts.push(genre.name.to_uppercase());
+        }
+        parts.push(format!("CH-{:03}", station.id));
+    }
+    if let Some(track) = app
+        .history
+        .first()
+        .filter(|track| !track.time_formatted.is_empty())
+    {
+        parts.push(format!("AIRED {}", track.time_formatted));
+    }
+    Line::styled(parts.join(" ▪ "), Style::default().fg(theme.muted))
+}
+
+/// `▶ STREAMING :: AAC/44.1KHZ/STEREO/128K` from the engine's telemetry.
+fn telemetry_line(app: &App, theme: &Theme) -> Line<'static> {
+    let (label, color) = match app.playback.state {
+        PlayerState::Playing => ("STREAMING", theme.accent),
+        PlayerState::Buffering => ("BUFFERING", theme.warn),
+        PlayerState::Paused => ("HOLD", theme.muted),
+        PlayerState::Error => ("FAULT", theme.warn),
+        PlayerState::Idle => return Line::default(),
+    };
+    let mut spans = vec![Span::styled(label, Style::default().fg(color))];
+    let segments = telemetry_segments(app);
+    if !segments.is_empty() {
+        spans.push(Span::styled(" :: ", Style::default().fg(theme.edge)));
+        spans.push(Span::styled(
+            segments.join("/").to_uppercase(),
+            Style::default().fg(theme.muted),
+        ));
     }
     Line::from(spans)
+}
+
+/// How far the track on air is, as a neon bar with its elapsed time. Radio
+/// has no duration, so the bar fills against the station's typical track
+/// length and stays empty when that is unknown.
+fn progress_line(app: &App, width: u16, theme: &Theme) -> Line<'static> {
+    let progress = app.progress();
+    let label = progress
+        .map(|progress| format!(" {}:{:02}", progress.elapsed / 60, progress.elapsed % 60))
+        .unwrap_or_default();
+    let bar = usize::from(width).saturating_sub(label.chars().count());
+    let filled = progress
+        .and_then(|progress| progress.fraction)
+        .map_or(0, |fraction| (fraction * bar as f64).round() as usize)
+        .min(bar);
+    let mut spans: Vec<Span<'static>> = (0..filled)
+        .map(|cell| {
+            let t = cell as f32 / bar.max(2).saturating_sub(1) as f32;
+            Span::styled("━", Style::default().fg(theme.gradient(t)))
+        })
+        .collect();
+    spans.push(Span::styled(
+        "─".repeat(bar - filled),
+        Style::default().fg(theme.edge),
+    ));
+    spans.push(Span::styled(label, Style::default().fg(theme.muted)));
+    Line::from(spans)
+}
+
+/// Previous, play/pause, and next as bracketed keys. They mirror the
+/// F7/F8/F9 and media keys; the middle one shows what it would do.
+fn buttons(app: &App, theme: &Theme) -> Vec<Span<'static>> {
+    let active = matches!(
+        app.playback.state,
+        PlayerState::Playing | PlayerState::Buffering
+    );
+    let bracket =
+        |text: &'static str| Span::styled(text, Style::default().fg(theme.edge).bg(theme.band));
+    let key = |label: &'static str, fg: Color| {
+        Span::styled(label, Style::default().fg(fg).bg(theme.band))
+    };
+    let (middle, color) = if active {
+        ("▮▮", theme.accent)
+    } else {
+        ("▶ ", theme.fg)
+    };
+    vec![
+        bracket("["),
+        key("|◀", theme.muted),
+        bracket("]"),
+        Span::raw(" "),
+        bracket("["),
+        key(middle, color),
+        bracket("]"),
+        Span::raw(" "),
+        bracket("["),
+        key("▶|", theme.muted),
+        bracket("]"),
+    ]
+}
+
+/// The cover in half-blocks: each cell shows two pixels, the top one as the
+/// foreground of "▀" and the bottom one as its background. Without a cover
+/// (or colors) it draws a quiet placeholder note.
+struct CoverArt<'a> {
+    cover: Option<&'a Cover>,
+    theme: &'a Theme,
+}
+
+impl<'a> CoverArt<'a> {
+    fn new(cover: Option<&'a Cover>, theme: &'a Theme) -> Self {
+        Self { cover, theme }
+    }
+}
+
+impl Widget for CoverArt<'_> {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        if area.is_empty() {
+            return;
+        }
+        let Some(cover) = self.cover.filter(|_| self.theme.colorful()) else {
+            buf.set_style(area, Style::default().bg(self.theme.band));
+            buf[(area.x + area.width / 2, area.y + area.height / 2)]
+                .set_symbol("♫")
+                .set_fg(self.theme.muted);
+            return;
+        };
+        let pixels = cover.sample(area.width, area.height * 2);
+        let width = usize::from(area.width);
+        let color = |[r, g, b]: [u8; 3]| Color::Rgb(r, g, b);
+        for row in 0..area.height {
+            for column in 0..area.width {
+                let top = usize::from(row) * 2 * width + usize::from(column);
+                buf[(area.x + column, area.y + row)]
+                    .set_symbol("▀")
+                    .set_fg(color(pixels[top]))
+                    .set_bg(color(pixels[top + width]));
+            }
+        }
+    }
+}
+
+/// Spectrum levels and peak caps to draw: live bands while audio is heard,
+/// nothing (all columns at rest) in every other state.
+fn spectrum_levels(app: &App) -> (&[f32], &[f32]) {
+    if app.playback.state == PlayerState::Playing {
+        (&app.playback.spectrum, &app.playback.spectrum_peaks)
+    } else {
+        (&[], &[])
+    }
+}
+
+/// The spectrum as columns of stacked pills ("▬") two cells apart, low
+/// frequencies on the left. Every column keeps one dim resting pill so the
+/// row reads as a floor; louder bands stack higher, shading from cyan at the
+/// bottom through violet to magenta at the top, and a peak cap floats where
+/// the column last reached before falling back. Levels and caps are drawn
+/// exactly as analyzed: no motion is invented here.
+struct Visualizer<'a> {
+    levels: &'a [f32],
+    peaks: &'a [f32],
+    theme: &'a Theme,
+}
+
+impl<'a> Visualizer<'a> {
+    fn new((levels, peaks): (&'a [f32], &'a [f32]), theme: &'a Theme) -> Self {
+        Self {
+            levels,
+            peaks,
+            theme,
+        }
+    }
+}
+
+/// The value of column `index` out of `columns`: max-pooling when there are
+/// at least as many bands as columns, interpolating between neighbors when
+/// there are fewer, so no band is ever drawn twice side by side.
+fn pooled(values: &[f32], index: usize, columns: usize) -> f32 {
+    let bands = values.len();
+    if bands == 0 || columns == 0 {
+        return 0.0;
+    }
+    let clean = |value: f32| {
+        if value.is_finite() {
+            value.clamp(0.0, 1.0)
+        } else {
+            0.0
+        }
+    };
+    if bands >= columns {
+        let first = index * bands / columns;
+        let last = ((index + 1) * bands)
+            .div_ceil(columns)
+            .clamp(first + 1, bands);
+        values[first..last]
+            .iter()
+            .copied()
+            .map(clean)
+            .fold(0.0, f32::max)
+    } else if columns == 1 {
+        clean(values[0])
+    } else {
+        let position = index as f32 * (bands - 1) as f32 / (columns - 1) as f32;
+        let low = position.floor() as usize;
+        let high = (low + 1).min(bands - 1);
+        let t = position - low as f32;
+        clean(values[low]) * (1.0 - t) + clean(values[high]) * t
+    }
+}
+
+impl Widget for Visualizer<'_> {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        if area.is_empty() {
+            return;
+        }
+        let rows = area.height;
+        let columns = usize::from(area.width.div_ceil(2));
+        let left = area.x + (area.width - (columns as u16 * 2 - 1)) / 2;
+        let theme = self.theme;
+        for index in 0..columns {
+            let level = pooled(self.levels, index, columns);
+            let x = left + index as u16 * 2;
+            // Each row is a step of 1/rows; the resting pill is always there.
+            let stack = (1 + (level * f32::from(rows)) as u16).min(rows);
+            for row in 0..stack {
+                let color = if rows == 1 {
+                    // A single row still shows loudness through color.
+                    if level < 0.2 {
+                        theme.glow
+                    } else {
+                        theme.gradient(level)
+                    }
+                } else if stack == 1 {
+                    theme.glow
+                } else {
+                    theme.gradient(f32::from(row) / f32::from(rows - 1))
+                };
+                buf[(x, area.bottom() - 1 - row)]
+                    .set_symbol("▬")
+                    .set_fg(color);
+            }
+            if rows > 1 {
+                let peak = pooled(self.peaks, index, columns);
+                let cap = (peak * f32::from(rows)) as u16;
+                if cap >= stack && cap < rows {
+                    buf[(x, area.bottom() - 1 - cap)]
+                        .set_symbol("▬")
+                        .set_fg(if peak >= 0.85 { theme.warn } else { theme.fg });
+                }
+            }
+        }
+    }
 }
 
 fn account(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
@@ -947,7 +1740,7 @@ mod tests {
         app.settings.favorites.insert(1);
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal
-            .draw(|frame| render(frame, &mut app, &theme))
+            .draw(|frame| render(frame, &mut app, &theme, &mut Graphics::default()))
             .unwrap();
         let text = terminal
             .backend()
@@ -961,7 +1754,7 @@ mod tests {
         assert!(!text.contains("radio-record"));
         app.category.select(Some(1));
         terminal
-            .draw(|frame| render(frame, &mut app, &theme))
+            .draw(|frame| render(frame, &mut app, &theme, &mut Graphics::default()))
             .unwrap();
         let text = terminal
             .backend()
@@ -991,43 +1784,105 @@ mod tests {
         assert_ne!(plain, Theme::amber());
     }
 
-    #[test]
-    fn meter_strokes_follow_the_level() {
+    fn pill_heights(buffer: &Buffer, area: Rect) -> Vec<u16> {
+        (area.left()..area.right())
+            .step_by(2)
+            .map(|x| {
+                (area.top()..area.bottom())
+                    .filter(|y| buffer[(x, *y)].symbol() == "▬")
+                    .count() as u16
+            })
+            .collect()
+    }
+
+    fn draw_visualizer(width: u16, height: u16, levels: &[f32], peaks: &[f32]) -> Buffer {
         let theme = Theme::default();
-        for (level, expected) in [(0.0, 0), (0.25, 10), (0.75, 30), (1.0, 40), (f64::NAN, 0)] {
-            let mut terminal = Terminal::new(TestBackend::new(40, 1)).unwrap();
-            terminal
-                .draw(|frame| {
-                    frame.render_widget(Paragraph::new(meter(40, level, &theme)), frame.area())
-                })
-                .unwrap();
-            let cells = terminal.backend().buffer().content();
-            assert!(cells.iter().all(|cell| cell.symbol() == "─"));
-            assert_eq!(
-                cells.iter().filter(|cell| cell.fg == theme.accent).count(),
-                expected
-            );
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| {
+                frame.render_widget(Visualizer::new((levels, peaks), &theme), frame.area())
+            })
+            .unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    #[test]
+    fn visualizer_stacks_neon_pills_by_level_with_peak_caps() {
+        let theme = Theme::default();
+        let levels = [0.0, 0.3, 0.6, 1.0, f32::NAN, -1.0, 7.0];
+        let peaks = [0.55, 0.9, 0.6, 1.0, f32::NAN, 0.0, 7.0];
+        let buffer = draw_visualizer(13, 4, &levels, &peaks);
+        let caps = |x: u16| (0..4).filter(|y| buffer[(x, *y)].symbol() == "▬").count();
+        assert_eq!(caps(0), 2, "resting pill plus its floating cap");
+        assert_eq!(caps(2), 3, "two pills plus a cap above them");
+        assert_eq!(
+            pill_heights(&buffer, Rect::new(4, 0, 9, 4)),
+            [3, 4, 1, 1, 4]
+        );
+        // Gaps between columns stay empty.
+        assert!((0..4).all(|y| buffer[(1, y)].symbol() == " "));
+        // Pills shade from cyan at the bottom to magenta at the top.
+        assert_eq!(buffer[(6, 3)].fg, theme.accent);
+        assert_eq!(buffer[(6, 0)].fg, theme.alert);
+        assert_eq!(buffer[(0, 3)].fg, theme.glow, "a silent column rests dim");
+        assert_eq!(buffer[(0, 1)].fg, theme.fg, "a cap below 0.85 is bright");
+        assert_eq!(
+            buffer[(2, 0)].fg,
+            theme.warn,
+            "a high cap glows warning yellow"
+        );
+        assert_eq!(
+            buffer[(4, 0)].symbol(),
+            " ",
+            "a cap inside its column is hidden"
+        );
+    }
+
+    #[test]
+    fn visualizer_pools_or_interpolates_without_repeating_bands() {
+        let mut levels = vec![0.0; 96];
+        levels[95] = 1.0;
+        let buffer = draw_visualizer(9, 3, &levels, &[]);
+        assert_eq!(pill_heights(&buffer, buffer.area), [1, 1, 1, 1, 3]);
+        let buffer = draw_visualizer(9, 4, &[0.0, 1.0], &[]);
+        assert_eq!(
+            pill_heights(&buffer, buffer.area),
+            [1, 2, 3, 4, 4],
+            "few bands spread smoothly across many columns"
+        );
+        for (width, height) in [(1, 1), (2, 1), (1, 5)] {
+            draw_visualizer(width, height, &levels, &levels);
         }
     }
 
     #[test]
-    fn the_meter_settles_when_not_playing() {
+    fn the_visualizer_settles_when_not_playing() {
         let theme = Theme::default();
         let mut app = fixture();
         app.now = app.selected_station().cloned();
         app.playback.state = PlayerState::Paused;
         app.playback.levels = [0.8, 0.6];
-        let mut terminal = Terminal::new(TestBackend::new(60, 4)).unwrap();
+        app.playback.spectrum = vec![1.0; 96];
+        app.playback.spectrum_peaks = vec![1.0; 96];
+        let mut terminal = Terminal::new(TestBackend::new(60, 6)).unwrap();
         terminal
             .draw(|frame| playback(frame, &app, frame.area(), &theme))
             .unwrap();
         let buffer = terminal.backend().buffer();
-        for column in 0..60u16 {
-            let cell = &buffer[(column, 0)];
-            if cell.symbol() == "─" {
-                assert_eq!(cell.fg, theme.edge, "the bar must be at rest");
+        let area = Rect::new(0, 0, 60, 3);
+        assert!(pill_heights(buffer, area).iter().all(|height| *height == 1));
+        for x in 0..60u16 {
+            let cell = &buffer[(x, 2)];
+            if cell.symbol() == "▬" {
+                assert_eq!(cell.fg, theme.glow, "the floor must be at rest");
             }
         }
+        app.playback.state = PlayerState::Playing;
+        terminal
+            .draw(|frame| playback(frame, &app, frame.area(), &theme))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        assert!(pill_heights(buffer, area).iter().all(|height| *height == 3));
     }
 
     #[test]
@@ -1039,20 +1894,20 @@ mod tests {
         app.playback.buffering = Some(42);
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal
-            .draw(|frame| render(frame, &mut app, &theme))
+            .draw(|frame| render(frame, &mut app, &theme, &mut Graphics::default()))
             .unwrap();
         let text = cell_text(terminal.backend().buffer());
         assert!(text.contains("· 42%"), "real cache progress must show");
         app.playback.buffering = None;
         terminal
-            .draw(|frame| render(frame, &mut app, &theme))
+            .draw(|frame| render(frame, &mut app, &theme, &mut Graphics::default()))
             .unwrap();
         assert!(!cell_text(terminal.backend().buffer()).contains("42%"));
         // A stale percentage must not leak into other states.
         app.playback.state = PlayerState::Playing;
         app.playback.buffering = Some(42);
         terminal
-            .draw(|frame| render(frame, &mut app, &theme))
+            .draw(|frame| render(frame, &mut app, &theme, &mut Graphics::default()))
             .unwrap();
         assert!(!cell_text(terminal.backend().buffer()).contains("42%"));
     }
@@ -1079,7 +1934,7 @@ mod tests {
         app.show_diag = true;
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
         terminal
-            .draw(|frame| render(frame, &mut app, &theme))
+            .draw(|frame| render(frame, &mut app, &theme, &mut Graphics::default()))
             .unwrap();
         let text = cell_text(terminal.backend().buffer());
         assert!(text.contains("Diagnostics"));
@@ -1092,11 +1947,14 @@ mod tests {
         // Outside diagnostics the machine stays hidden.
         app.show_diag = false;
         terminal
-            .draw(|frame| render(frame, &mut app, &theme))
+            .draw(|frame| render(frame, &mut app, &theme, &mut Graphics::default()))
             .unwrap();
         let text = cell_text(terminal.backend().buffer());
         assert!(!text.contains("Diagnostics"));
-        assert!(!text.contains("128k"));
+        // The status line drops its telemetry segments; the panel's own HUD
+        // line keeps showing the stream format in caps.
+        assert!(!text.contains("· 128k"));
+        assert!(text.contains("AAC/44.1KHZ STEREO/128K"));
         assert!(!text.contains("generation"));
     }
 
@@ -1110,7 +1968,7 @@ mod tests {
             app.account.password_focus = true;
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             terminal
-                .draw(|frame| render(frame, &mut app, &Theme::default()))
+                .draw(|frame| render(frame, &mut app, &Theme::default(), &mut Graphics::default()))
                 .unwrap();
             let text = cell_text(terminal.backend().buffer());
             assert!(text.contains("Sign in to Radio Record"));
@@ -1133,7 +1991,7 @@ mod tests {
             });
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             terminal
-                .draw(|frame| render(frame, &mut app, &Theme::default()))
+                .draw(|frame| render(frame, &mut app, &Theme::default(), &mut Graphics::default()))
                 .unwrap();
             let text = cell_text(terminal.backend().buffer());
             assert!(text.contains("Resolve favorites"));
@@ -1162,7 +2020,7 @@ mod tests {
             app.now = app.selected_station().cloned();
             app.playback.state = PlayerState::Playing;
             terminal
-                .draw(|frame| render(frame, &mut app, &theme))
+                .draw(|frame| render(frame, &mut app, &theme, &mut Graphics::default()))
                 .unwrap();
             let buffer = terminal.backend().buffer();
             assert!(
@@ -1191,11 +2049,12 @@ mod tests {
                     song: "Очень длинное название трека 音楽 🎵".repeat(4),
                     image100: String::new(),
                     image200: String::new(),
+                    time: 0,
                     time_formatted: "12:34".into(),
                 })
                 .collect();
             terminal
-                .draw(|frame| render(frame, &mut app, &theme))
+                .draw(|frame| render(frame, &mut app, &theme, &mut Graphics::default()))
                 .unwrap();
             if width >= 80 {
                 let buffer = terminal.backend().buffer();
@@ -1216,17 +2075,17 @@ mod tests {
             }
             app.help = true;
             terminal
-                .draw(|frame| render(frame, &mut app, &theme))
+                .draw(|frame| render(frame, &mut app, &theme, &mut Graphics::default()))
                 .unwrap();
             app.help = false;
             app.show_diag = true;
             terminal
-                .draw(|frame| render(frame, &mut app, &theme))
+                .draw(|frame| render(frame, &mut app, &theme, &mut Graphics::default()))
                 .unwrap();
             app.show_diag = false;
             app.category.select(Some(1));
             terminal
-                .draw(|frame| render(frame, &mut app, &theme))
+                .draw(|frame| render(frame, &mut app, &theme, &mut Graphics::default()))
                 .unwrap();
         }
     }
@@ -1247,7 +2106,7 @@ mod tests {
         app.stations.select(Some(99));
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal
-            .draw(|frame| render(frame, &mut app, &theme))
+            .draw(|frame| render(frame, &mut app, &theme, &mut Graphics::default()))
             .unwrap();
         let text = terminal
             .backend()
@@ -1258,5 +2117,270 @@ mod tests {
             .collect::<String>();
         assert!(text.contains("Station 099"));
         assert!(!text.contains("Station 000"));
+    }
+
+    fn playing_app() -> App {
+        let mut app = fixture();
+        app.now = app.selected_station().cloned();
+        app.playback.state = PlayerState::Playing;
+        app.playback.spectrum = (0..48).map(|i| (i as f32 / 47.0).powi(2)).collect();
+        app.history = vec![
+            crate::app::tests::track(10_000, ""),
+            crate::app::tests::track(9_900, ""),
+        ];
+        app.clock = 10_050;
+        app
+    }
+
+    #[test]
+    fn the_now_playing_panel_appears_when_there_is_room() {
+        let theme = Theme::default();
+        for (height, cover_rows) in [(40u16, 7u16), (24, 5)] {
+            let mut app = playing_app();
+            app.cover = Some(crate::cover::tests::cover("https://example.com/a.jpg"));
+            let mut terminal = Terminal::new(TestBackend::new(80, height)).unwrap();
+            terminal
+                .draw(|frame| render(frame, &mut app, &theme, &mut Graphics::default()))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let text = cell_text(buffer);
+            assert!(text.contains("♫ record.sh"), "{height}: window title");
+            assert!(text.contains("Song") && text.contains("Artist"));
+            assert!(text.contains(" 0:50"), "elapsed time of the track on air");
+            assert!(text.contains("|◀") && text.contains("▮▮") && text.contains("▶|"));
+            assert!(text.contains("▶  Record"), "status stays visible");
+            let art = buffer
+                .content()
+                .iter()
+                .filter(|cell| {
+                    // The resize filter may shift a channel by one step.
+                    matches!(cell.fg, Color::Rgb(r, g, b) if r > 240 && (110..130).contains(&g) && b < 40)
+                        && cell.symbol() == "▀"
+                })
+                .count();
+            assert_eq!(art, usize::from(cover_rows * cover_rows * 2), "{height}");
+            assert!(
+                buffer
+                    .content()
+                    .iter()
+                    .any(|cell| cell.symbol() == "▬" && cell.fg == theme.alert),
+                "the visualizer runs inside the panel"
+            );
+        }
+        let mut app = playing_app();
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        terminal
+            .draw(|frame| render(frame, &mut app, &theme, &mut Graphics::default()))
+            .unwrap();
+        let text = cell_text(terminal.backend().buffer());
+        assert!(
+            !text.contains(".sh"),
+            "short terminals keep the compact footer"
+        );
+        assert!(text.contains("▬") && text.contains("▶  Record"));
+    }
+
+    #[test]
+    fn the_panel_shows_a_placeholder_without_art_or_colors() {
+        for theme in [Theme::default(), Theme::plain()] {
+            let mut app = playing_app();
+            if !theme.colorful() {
+                app.cover = Some(crate::cover::tests::cover("https://example.com/a.jpg"));
+            }
+            let mut terminal = Terminal::new(TestBackend::new(80, 40)).unwrap();
+            terminal
+                .draw(|frame| render(frame, &mut app, &theme, &mut Graphics::default()))
+                .unwrap();
+            let text = cell_text(terminal.backend().buffer());
+            assert!(!text.contains("▀"), "no picture is drawn");
+            assert!(
+                text.matches('♫').count() >= 2,
+                "title and placeholder notes"
+            );
+        }
+        let mut app = playing_app();
+        app.now = None;
+        app.history.clear();
+        app.playback = Default::default();
+        let mut terminal = Terminal::new(TestBackend::new(80, 40)).unwrap();
+        terminal
+            .draw(|frame| render(frame, &mut app, &Theme::default(), &mut Graphics::default()))
+            .unwrap();
+        let text = cell_text(terminal.backend().buffer());
+        assert!(text.contains("♫ music.sh") && text.contains("Stopped"));
+    }
+
+    #[test]
+    fn sharp_covers_use_the_terminal_protocol_until_an_overlay_opens() {
+        let theme = Theme::default();
+        let mut picker = Picker::halfblocks();
+        picker.set_protocol_type(ProtocolType::Kitty);
+        let mut graphics = Graphics {
+            picker: Some(picker),
+            cached: None,
+        };
+        let mut app = playing_app();
+        app.cover = Some(crate::cover::tests::cover("https://example.com/a.jpg"));
+        let mut terminal = Terminal::new(TestBackend::new(80, 40)).unwrap();
+        let halfblocks = |terminal: &Terminal<TestBackend>| {
+            cell_text(terminal.backend().buffer()).matches('▀').count()
+        };
+        terminal
+            .draw(|frame| render(frame, &mut app, &theme, &mut graphics))
+            .unwrap();
+        assert_eq!(halfblocks(&terminal), 0, "the picture replaces pixel art");
+        let (url, area) = graphics
+            .cached
+            .as_ref()
+            .map(|(url, area, _)| (url.clone(), *area))
+            .unwrap();
+        assert_eq!(url, "https://example.com/a.jpg");
+        app.help = true;
+        terminal
+            .draw(|frame| render(frame, &mut app, &theme, &mut graphics))
+            .unwrap();
+        assert!(
+            halfblocks(&terminal) > 0,
+            "popups cover pixel art, not pictures"
+        );
+        app.help = false;
+        terminal
+            .draw(|frame| render(frame, &mut app, &theme, &mut graphics))
+            .unwrap();
+        assert_eq!(halfblocks(&terminal), 0);
+        assert_eq!(
+            graphics.cached.as_ref().map(|(_, area, _)| *area),
+            Some(area)
+        );
+    }
+
+    fn render_text(app: &mut App, width: u16, height: u16) -> (String, Buffer) {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| render(frame, app, &Theme::default(), &mut Graphics::default()))
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (cell_text(&buffer), buffer)
+    }
+
+    #[test]
+    fn the_hud_header_reports_machine_state() {
+        let mut app = playing_app();
+        let (text, _) = render_text(&mut app, 100, 30);
+        assert!(text.contains("RADIO//RECORD") && text.contains("◉ ON AIR"));
+        assert!(text.contains("CHANNELS") && text.contains("01/03"));
+        assert!(text.contains("◉ LIVE"), "the playing row is tagged");
+        app.playback.state = PlayerState::Buffering;
+        app.playback.buffering = Some(42);
+        assert!(render_text(&mut app, 100, 30).0.contains("◉ SYNC 42%"));
+        app.playback = Default::default();
+        app.now = None;
+        let (text, _) = render_text(&mut app, 100, 30);
+        assert!(text.contains("○ STANDBY") && !text.contains("LIVE"));
+    }
+
+    #[test]
+    fn panel_fits_the_visualizer_beside_or_below_the_details() {
+        let wide = Panel::fit(39, 123).unwrap();
+        assert_eq!((wide.cover_rows, wide.below_rows, wide.height()), (7, 0, 9));
+        let narrow = Panel::fit(23, 60).unwrap();
+        assert_eq!(
+            (narrow.cover_rows, narrow.below_rows, narrow.height()),
+            (5, 2, 9)
+        );
+        assert_eq!(Panel::fit(19, 200), None);
+        let volume: String = volume_meter(65, &Theme::default())
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert_eq!(volume, "VOL ━━━━━━━─── 65%");
+        let mut app = playing_app();
+        assert!(
+            signal(&app, &Theme::default()).is_empty(),
+            "no cache, no meter"
+        );
+        app.playback.cache_seconds = Some(1.6);
+        let signal: String = signal(&app, &Theme::default())
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert_eq!(signal, "SIG ▂▃▅▇ BUF 1.6s");
+    }
+
+    #[test]
+    fn a_new_title_decodes_only_with_full_motion() {
+        let mut app = playing_app();
+        app.track_since = Some((Duration::from_secs(10), 42));
+        app.uptime = Duration::from_millis(10_100);
+        assert!(
+            render_text(&mut app, 100, 30).0.contains("Song"),
+            "still when off"
+        );
+        app.fx = fx::Fx::Full;
+        let (text, _) = render_text(&mut app, 100, 30);
+        assert!(
+            text.contains('█') && !text.contains("Song█"),
+            "decoding: {text}"
+        );
+        app.uptime = Duration::from_secs(11);
+        let (text, _) = render_text(&mut app, 100, 30);
+        assert!(text.contains("Song") && !text.contains("Song█"), "resolved");
+        app.fx = fx::Fx::Calm;
+        app.uptime = Duration::from_millis(10_100);
+        assert!(render_text(&mut app, 100, 30).0.contains("Song"));
+    }
+
+    #[test]
+    fn the_frame_glows_with_the_bass_unless_motion_is_off() {
+        let theme = Theme::default();
+        let mut app = playing_app();
+        app.playback.spectrum = vec![1.0; 96];
+        let corner = |buffer: &Buffer| {
+            buffer
+                .content()
+                .iter()
+                .rev()
+                .find(|cell| cell.symbol() == "┛")
+                .map(|cell| cell.fg)
+                .unwrap()
+        };
+        let (_, buffer) = render_text(&mut app, 100, 30);
+        assert_eq!(corner(&buffer), theme.edge, "off: a still frame");
+        app.fx = fx::Fx::Calm;
+        let (_, loud) = render_text(&mut app, 100, 30);
+        assert_ne!(corner(&loud), theme.edge, "bass lights the frame");
+        app.playback.spectrum = vec![0.0; 96];
+        let (_, quiet) = render_text(&mut app, 100, 30);
+        assert_eq!(corner(&quiet), theme.edge, "silence rests");
+    }
+
+    #[test]
+    fn buffering_shows_the_real_fill_as_signal_acquiring() {
+        let theme = Theme::default();
+        let mut app = playing_app();
+        app.playback.state = PlayerState::Buffering;
+        app.playback.buffering = Some(50);
+        assert!(
+            !render_text(&mut app, 100, 30)
+                .0
+                .contains("SIGNAL ACQUIRING")
+        );
+        app.fx = fx::Fx::Calm;
+        let (text, buffer) = render_text(&mut app, 100, 30);
+        assert!(text.contains("SIGNAL ACQUIRING 50%"));
+        let warn = buffer
+            .content()
+            .iter()
+            .filter(|cell| cell.symbol() == "▬" && cell.fg == theme.warn)
+            .count();
+        let rest = buffer
+            .content()
+            .iter()
+            .filter(|cell| cell.symbol() == "▬" && cell.fg == theme.glow)
+            .count();
+        assert!(
+            warn > 0 && warn.abs_diff(rest) <= 1,
+            "half full: {warn} vs {rest}"
+        );
     }
 }

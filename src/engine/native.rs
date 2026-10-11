@@ -11,6 +11,8 @@
 //!        ↑ atomics                                  ↓ interleaved f32
 //!        |                                       rtrb ring (fixed capacity)
 //! audio callback (cpal) ← pops samples, applies volume, counts underruns
+//!        ↓ atomics (scope ring)
+//! worker: FFT of the newest heard samples → Snapshot::spectrum
 //! ```
 //!
 //! During pause the reader drains the stream and the callback clears queued
@@ -20,6 +22,7 @@ use crate::api::{Stream, StreamKind};
 use crate::engine::{EngineImpl, native_plays};
 use crate::error::{Error, Result};
 use crate::player::{AudioMeter, Failure, PlayerState, Snapshot, Streams};
+use crate::spectrum::{Analyzer, FFT_SIZE};
 use rtrb::{Consumer, Producer, RingBuffer};
 use std::io::Read;
 use std::sync::Arc;
@@ -44,6 +47,16 @@ const READ_TIMEOUT: Duration = Duration::from_secs(2);
 const HLS_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_PLAYLIST_BYTES: u64 = 256 * 1024;
 const MAX_SEGMENT_BYTES: u64 = 4 * 1024 * 1024;
+// Mono samples the callback publishes for the visualizer: about 680 ms at
+// 48 kHz. A power of two so the index wraps with a mask.
+const SCOPE_CAPACITY: usize = 32_768;
+// Room left for the callback to keep writing while the worker copies a
+// window out; the visualizer delay can never reach into it.
+const SCOPE_MARGIN: usize = 4_096;
+const MAX_SCOPE_DELAY: usize = SCOPE_CAPACITY - FFT_SIZE - SCOPE_MARGIN;
+// The analysis tick and the redraw gate already lag about this much on
+// average; only output latency beyond it delays the window.
+const VISUAL_LAG_US: u64 = 25_000;
 
 /// A running output: dropping it stops consuming the ring.
 pub(crate) trait SinkHandle: Send {
@@ -68,6 +81,13 @@ pub(crate) struct OutputState {
     left_db: AtomicU32,
     right_db: AtomicU32,
     meter_sequence: AtomicU64,
+    /// Recently heard mono samples (f32 bits) at the device rate: an
+    /// overwrite ring the callback writes and the worker reads, no locks.
+    scope: Box<[AtomicU32]>,
+    scope_written: AtomicU64,
+    device_rate: AtomicU32,
+    /// Time from the callback to the samples reaching the speaker.
+    latency_us: AtomicU32,
 }
 
 impl OutputState {
@@ -82,6 +102,10 @@ impl OutputState {
             left_db: AtomicU32::new(f32::NEG_INFINITY.to_bits()),
             right_db: AtomicU32::new(f32::NEG_INFINITY.to_bits()),
             meter_sequence: AtomicU64::new(0),
+            scope: (0..SCOPE_CAPACITY).map(|_| AtomicU32::new(0)).collect(),
+            scope_written: AtomicU64::new(0),
+            device_rate: AtomicU32::new(0),
+            latency_us: AtomicU32::new(0),
         }
     }
 }
@@ -131,6 +155,9 @@ pub(crate) struct NativeEngine {
     consumer: Option<Consumer<f32>>,
     sink: Option<Box<dyn SinkHandle>>,
     meter: AudioMeter,
+    analyzer: Analyzer,
+    scope_seen: u64,
+    scope_window: Vec<f32>,
     snapshot: Snapshot,
 }
 
@@ -143,6 +170,8 @@ impl EngineImpl for NativeEngine {
         self.output = Arc::new(OutputState::new(volume));
         self.meter_seen = 0;
         self.meter = AudioMeter::default();
+        self.analyzer.reset();
+        self.scope_seen = 0;
         self.snapshot = Snapshot::default();
         self.events = None;
         let playable: Vec<Stream> = streams
@@ -232,9 +261,14 @@ impl EngineImpl for NativeEngine {
                     ))),
                 );
             }
+            self.update_spectrum();
         } else {
             self.snapshot.levels = [0.0; 2];
             self.meter = AudioMeter::default();
+            self.snapshot.spectrum.clear();
+            self.snapshot.spectrum_peaks.clear();
+            self.analyzer.reset();
+            self.scope_seen = self.output.scope_written.load(Ordering::Acquire);
         }
         Ok(())
     }
@@ -255,8 +289,47 @@ impl NativeEngine {
             consumer: None,
             sink: None,
             meter: AudioMeter::default(),
+            analyzer: Analyzer::new(44_100),
+            scope_seen: 0,
+            scope_window: Vec::with_capacity(FFT_SIZE),
             snapshot: Snapshot::default(),
         }
+    }
+
+    /// Analyze the newest window the listener is hearing. The window ends
+    /// `latency − VISUAL_LAG_US` before the newest sample, so columns move
+    /// with the sound even on high-latency (Bluetooth) outputs.
+    fn update_spectrum(&mut self) {
+        let written = self.output.scope_written.load(Ordering::Acquire);
+        let rate = self.output.device_rate.load(Ordering::Relaxed);
+        if written == self.scope_seen || rate == 0 {
+            return;
+        }
+        self.scope_seen = written;
+        if self.analyzer.rate() != rate {
+            self.analyzer = Analyzer::new(rate);
+        }
+        let latency = u64::from(self.output.latency_us.load(Ordering::Relaxed));
+        // The window's center sits half a window back; a quarter of it is
+        // already late enough to line up with the redraw.
+        let delay = (latency.saturating_sub(VISUAL_LAG_US) * u64::from(rate) / 1_000_000)
+            .saturating_sub((FFT_SIZE / 4) as u64)
+            .min(MAX_SCOPE_DELAY as u64);
+        let end = written.saturating_sub(delay);
+        let start = end.saturating_sub(FFT_SIZE as u64);
+        self.scope_window.clear();
+        self.scope_window.extend((start..end).map(|index| {
+            f32::from_bits(
+                self.output.scope[index as usize & (SCOPE_CAPACITY - 1)].load(Ordering::Relaxed),
+            )
+        }));
+        let levels = self.analyzer.analyze(&self.scope_window);
+        self.snapshot.spectrum.clear();
+        self.snapshot.spectrum.extend_from_slice(levels);
+        self.snapshot.spectrum_peaks.clear();
+        self.snapshot
+            .spectrum_peaks
+            .extend_from_slice(self.analyzer.peaks());
     }
 
     fn fail(&mut self, message: String) {
@@ -300,6 +373,8 @@ impl NativeEngine {
                 self.consumer = Some(consumer);
                 self.meter = AudioMeter::default();
                 self.meter_seen = self.output.meter_sequence.load(Ordering::Acquire);
+                self.analyzer.reset();
+                self.scope_seen = self.output.scope_written.load(Ordering::Acquire);
                 self.output.fill.store(0, Ordering::Relaxed);
                 self.output.buffering.store(true, Ordering::Release);
                 self.snapshot = Snapshot {
@@ -347,12 +422,15 @@ struct OutputCallback {
     meter_window: usize,
     meter_count: usize,
     squares: [f64; 2],
+    scope_index: u64,
 }
 
 impl OutputCallback {
     fn new(consumer: Consumer<f32>, output: Arc<OutputState>, rate: u32, device_rate: u32) -> Self {
+        output.device_rate.store(device_rate, Ordering::Relaxed);
         Self {
             consumer,
+            scope_index: output.scope_written.load(Ordering::Acquire),
             epoch: output.pause_epoch.load(Ordering::Acquire),
             output,
             resample: Resample::new(rate, device_rate),
@@ -391,6 +469,7 @@ impl OutputCallback {
                 match self.resample.frame(&mut self.consumer) {
                     Some(samples) => {
                         self.measure(samples);
+                        self.scope(samples);
                         samples
                     }
                     None => {
@@ -418,11 +497,35 @@ impl OutputCallback {
             self.output.underruns.fetch_add(1, Ordering::Relaxed);
         }
         self.output
+            .scope_written
+            .store(self.scope_index, Ordering::Release);
+        self.output
             .fill
             .store(self.consumer.slots() as u32, Ordering::Relaxed);
         self.output
             .buffering
             .store(!self.playing, Ordering::Release);
+    }
+
+    /// Record the device's reported output latency; a plain copy of two
+    /// timestamps, safe on the real-time thread.
+    fn note_latency(&self, info: &cpal::OutputCallbackInfo) {
+        let timestamp = info.timestamp();
+        let latency = timestamp
+            .playback
+            .saturating_duration_since(timestamp.callback)
+            .min(Duration::from_millis(500));
+        self.output
+            .latency_us
+            .store(latency.as_micros() as u32, Ordering::Relaxed);
+    }
+
+    /// Publish one heard frame, mixed to mono, for the visualizer.
+    fn scope(&mut self, samples: [f32; 2]) {
+        let mono = (samples[0] + samples[1]) * 0.5;
+        self.output.scope[self.scope_index as usize & (SCOPE_CAPACITY - 1)]
+            .store(mono.to_bits(), Ordering::Relaxed);
+        self.scope_index += 1;
     }
 
     fn measure(&mut self, samples: [f32; 2]) {
@@ -677,7 +780,10 @@ pub(crate) fn cpal_sink(
         device
             .build_output_stream(
                 config,
-                move |data: &mut [T], _| callback.fill(data),
+                move |data: &mut [T], info: &cpal::OutputCallbackInfo| {
+                    callback.note_latency(info);
+                    callback.fill(data)
+                },
                 error_callback,
                 None,
             )
@@ -1669,6 +1775,34 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn scope_records_only_heard_frames_as_mono() {
+        let output = Arc::new(OutputState::new(0));
+        let (mut producer, consumer) = RingBuffer::new(256);
+        let mut callback = OutputCallback::new(consumer, output.clone(), 100, 100);
+        assert_eq!(output.device_rate.load(Ordering::Relaxed), 100);
+        let mut buffer = [0.0f32; 10];
+        producer.push_entire_slice(&[0.2, 0.6].repeat(10)).unwrap();
+        callback.fill(&mut buffer);
+        assert_eq!(
+            output.scope_written.load(Ordering::Acquire),
+            0,
+            "prebuffering is not heard"
+        );
+        producer.push_entire_slice(&[0.2, 0.6].repeat(40)).unwrap();
+        callback.fill(&mut buffer);
+        assert_eq!(output.scope_written.load(Ordering::Acquire), 5);
+        let first = f32::from_bits(output.scope[0].load(Ordering::Relaxed));
+        assert!((first - 0.4).abs() < 1e-6, "pre-gain mono mix, got {first}");
+        output.paused.store(true, Ordering::Release);
+        callback.fill(&mut buffer);
+        assert_eq!(
+            output.scope_written.load(Ordering::Acquire),
+            5,
+            "paused output publishes nothing"
+        );
+    }
+
+    #[test]
     fn output_notifications_keep_native_playback_alive() {
         let mut engine = engine();
         let failed = Arc::new(AtomicBool::new(false));
@@ -1762,12 +1896,20 @@ pub(crate) mod tests {
         assert!(snapshot.levels[0] > 0.0, "the meter must follow real audio");
         assert!(snapshot.levels[1] > 0.0);
         assert!(snapshot.cache_seconds.is_some());
+        assert!(
+            wait_for(&mut engine, 2.0, |engine| {
+                engine.snapshot.spectrum.iter().any(|level| *level > 0.0)
+            }),
+            "the visualizer must follow real audio"
+        );
+        assert_eq!(engine.snapshot.spectrum.len(), crate::spectrum::BANDS);
         pump(&mut engine, 0.2);
         // Pause is radio: the state flips and the meter settles.
         engine.pause();
         pump(&mut engine, 0.3);
         assert_eq!(engine.snapshot.state, PlayerState::Paused);
         assert_eq!(engine.snapshot.levels, [0.0, 0.0]);
+        assert!(engine.snapshot.spectrum.is_empty());
         engine.pause();
         assert!(
             wait_for(&mut engine, 4.0, |engine| {
