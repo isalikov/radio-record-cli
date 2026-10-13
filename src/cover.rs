@@ -1,12 +1,81 @@
 //! Track cover art for the now-playing panel. A background fetch downloads
 //! the API's cover, decodes it (JPEG or PNG), and shrinks it once to a small
-//! RGB grid; the UI box-samples that grid into half-block cells, which gives
-//! the chunky pixel-art look and works in every truecolor terminal. The
+//! RGB grid; the UI box-samples that grid into cells at the chosen `CoverMode`,
+//! which gives the pixel-art look and works in every truecolor terminal. The
 //! decoded original is kept for terminals that can show real pictures.
 
 use crate::error::{Error, Result};
+use serde::{Deserialize, Serialize};
 use std::io::Read;
 use std::time::Duration;
+
+/// How much detail the now-playing cover shows, coarsest first. Saved in
+/// `settings.json` as `"cover"`, cycled with `c`, and overridden for one
+/// session by `RADIO_RECORD_COVER`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CoverMode {
+    /// No cover: nothing is downloaded and the details take its place.
+    Off,
+    /// Big square blocks, two cells wide and one row tall.
+    Chunky,
+    /// Half-blocks: two square pixels per cell.
+    #[default]
+    Pixel,
+    /// Quadrant blocks: four pixels per cell, two colors each.
+    Fine,
+    /// A real picture through the terminal's graphics protocol, if any.
+    Sharp,
+}
+
+impl CoverMode {
+    pub const ALL: [Self; 5] = [
+        Self::Off,
+        Self::Chunky,
+        Self::Pixel,
+        Self::Fine,
+        Self::Sharp,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Chunky => "chunky",
+            Self::Pixel => "pixel",
+            Self::Fine => "fine",
+            Self::Sharp => "sharp",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|mode| mode.name() == value)
+    }
+
+    /// The next mode with more detail, wrapping from `sharp` to `off`.
+    pub fn next(self) -> Self {
+        let index = Self::ALL.iter().position(|mode| *mode == self).unwrap_or(0);
+        Self::ALL[(index + 1) % Self::ALL.len()]
+    }
+}
+
+impl Serialize for CoverMode {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.name())
+    }
+}
+
+/// An unknown name (say, from a newer version) falls back to the default
+/// instead of making the whole settings file unreadable.
+impl<'de> Deserialize<'de> for CoverMode {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        let name = String::deserialize(deserializer)?;
+        Ok(Self::parse(&name).unwrap_or_default())
+    }
+}
 
 /// Stored resolution: twice the largest panel cover (14 cells, 14 pixels)
 /// so every size the UI draws is a clean downsample.
@@ -144,5 +213,20 @@ pub(crate) mod tests {
     fn garbage_is_an_error_not_a_panic() {
         assert!(Cover::decode("u", b"not an image").is_err());
         assert!(Cover::decode("u", &[]).is_err());
+    }
+
+    #[test]
+    fn cover_modes_cycle_and_round_trip_by_name() {
+        let mut mode = CoverMode::default();
+        assert_eq!(mode, CoverMode::Pixel);
+        let mut seen = Vec::new();
+        for _ in 0..CoverMode::ALL.len() {
+            mode = mode.next();
+            seen.push(mode);
+            assert_eq!(CoverMode::parse(mode.name()), Some(mode));
+        }
+        assert_eq!(mode, CoverMode::Pixel, "the cycle visits every mode once");
+        assert!(seen.contains(&CoverMode::Off) && seen.contains(&CoverMode::Sharp));
+        assert_eq!(CoverMode::parse("blurry"), None);
     }
 }

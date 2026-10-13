@@ -14,6 +14,8 @@ pub struct Settings {
     pub volume: u8,
     /// Liked songs, oldest first. Kept locally; never synced to the account.
     pub songs: Vec<crate::songs::Song>,
+    /// Cover detail in the now-playing panel.
+    pub cover: crate::cover::CoverMode,
 }
 
 impl Default for Settings {
@@ -22,6 +24,7 @@ impl Default for Settings {
             favorites: BTreeSet::new(),
             volume: 65,
             songs: Vec::new(),
+            cover: crate::cover::CoverMode::default(),
         }
     }
 }
@@ -90,6 +93,8 @@ mod tests {
         fs::write(&path, r#"{"favorites":[3],"volume":40}"#).unwrap();
         let mut settings = Settings::load(&path).unwrap();
         assert!(settings.songs.is_empty());
+        assert_eq!(settings.cover, crate::cover::CoverMode::Pixel);
+        settings.cover = crate::cover::CoverMode::Fine;
         settings.songs.push(crate::songs::Song {
             artist: "Артист".into(),
             song: "Песня".into(),
@@ -99,7 +104,17 @@ mod tests {
         settings.save(&path).unwrap();
         let loaded = Settings::load(&path).unwrap();
         assert_eq!(loaded.songs, settings.songs);
+        assert_eq!(loaded.cover, crate::cover::CoverMode::Fine);
         assert_eq!(loaded.favorites, BTreeSet::from([3]));
+    }
+    #[test]
+    fn an_unknown_cover_mode_falls_back_to_pixel() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        fs::write(&path, r#"{"volume":40,"cover":"hologram"}"#).unwrap();
+        let settings = Settings::load(&path).unwrap();
+        assert_eq!(settings.cover, crate::cover::CoverMode::Pixel);
+        assert_eq!(settings.volume, 40);
     }
     #[test]
     fn corrupt_settings_are_reported_instead_of_silently_overwritten() {

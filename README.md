@@ -107,6 +107,7 @@ Settings live in `~/.config/radio-record` by default; the script honours the sam
 | l | Like / unlike the song on air |
 | v | Open / close the track vault (liked songs) |
 | i | Show / hide recent tracks |
+| c | Cover detail: off → chunky → pixel → fine → sharp (saved) |
 | d | Toggle diagnostics overlay |
 | a | Open account, sign in, sync favorites, or sign out |
 | PgUp / PgDn, Home / End | Scroll stations |
@@ -218,7 +219,7 @@ that file. Cookies and passwords are not stored. `RADIO_RECORD_CONFIG_DIR` and
 | --- | --- | --- |
 | `RADIO_RECORD_THEME` | `default`, `amber`, `phosphor`, `paper` | Color theme |
 | `RADIO_RECORD_FX` | `full`, `calm`, `off` | How much the interface moves |
-| `RADIO_RECORD_COVER` | `pixel`, `sharp` | Pixel-art or real cover images |
+| `RADIO_RECORD_COVER` | `off`, `chunky`, `pixel`, `fine`, `sharp` | Cover detail for this session, overriding the saved setting |
 | `RADIO_RECORD_CONFIG_DIR` | path | Where settings are stored |
 | `RADIO_RECORD_BASE_URL` | URL | API base, for development |
 | `NO_COLOR` | any non-empty value | Disables colors; wins over the theme |
@@ -232,13 +233,24 @@ line. The top line shows the playback state (`◉ ON AIR`, `◉ SYNC 42%`,
 `▮▮ HOLD`, `! FAULT`, or `○ STANDBY`), the favorite station count, the
 liked-song count (`♥ 3`), and uptime.
 
-`RADIO_RECORD_COVER` selects how covers are drawn: `pixel` (default) draws
-pixel art with half-block characters in any truecolor terminal; `sharp` asks
-the terminal at startup for a picture protocol (kitty, sixel, or iTerm2) and
-shows the real image, falling back to pixel art when none is offered or while
-a popup is open. Use `sharp` only in a terminal emulator: a terminal that
-never answers the query delays startup by 2 seconds and swallows the first key.
-An unknown value falls back to `pixel` with a note on stderr.
+Covers come in five levels of detail, cycled with `c` and saved as `"cover"`
+in `settings.json`:
+
+| Mode | Look |
+| --- | --- |
+| `off` | No cover; nothing is downloaded and the details move left |
+| `chunky` | Big square blocks, 7 × 7 on the tall panel |
+| `pixel` | Half-blocks, 14 × 14 (default) |
+| `fine` | Quadrant blocks, 28 × 14 with two colors per cell; needs no special font |
+| `sharp` | The real image through a picture protocol (kitty, sixel, or iTerm2) |
+
+`sharp` asks the terminal for a picture protocol once per session, the first
+time it is on, and falls back to `pixel` when none is offered or while a popup
+is open. Use it only in a terminal emulator: a terminal that never answers the
+query freezes the player for 2 seconds and swallows the next key.
+`RADIO_RECORD_COVER` picks the mode for one session without saving it; an
+unknown value keeps the saved setting with a note on stderr, and an unknown
+`"cover"` in `settings.json` falls back to `pixel`.
 
 `RADIO_RECORD_THEME` selects a color theme: `default` (NEON-77: neon cyan,
 magenta, and violet on near-black),
@@ -315,8 +327,9 @@ full cover height, or below them when the panel is narrow. The keys mirror
 F7/F8/F9; there is no mouse support. Live radio has no track length,
 so the bar shows time since the track started on air and fills against the
 median length of the station's recent tracks; it stays empty until that is
-known. Covers are 200 px images from the history API, fetched once per track;
-a missing cover shows a placeholder note, as does `NO_COLOR`.
+known. Covers are 200 px images from the history API, fetched once per track
+and drawn at the detail chosen with `c`; a missing cover shows a placeholder
+note, as does `NO_COLOR`.
 
 Press `d` for a diagnostics overlay: player state and generation, codec, sample
 rate, channels, bitrate, the active stream and its fallback round, cache fill
@@ -332,7 +345,7 @@ engine decodes AAC in-process. macOS system media controls belong to radio-recor
 and remain available across station changes. Volume is software gain
 and does not change system volume.
 
-Favorites, volume, and liked songs are saved atomically in `~/.config/radio-record/settings.json`.
+Favorites, volume, liked songs, and the cover mode are saved atomically in `~/.config/radio-record/settings.json`.
 Directory precedence: `RADIO_RECORD_CONFIG_DIR`, `$XDG_CONFIG_HOME/radio-record`,
 `~/.config/radio-record`. Corrupt settings are reported rather than overwritten.
 

@@ -7,7 +7,7 @@ use std::{
 
 use crate::{
     api::{Catalog, Station, Stream, Track},
-    cover::Cover,
+    cover::{Cover, CoverMode},
     player::{PlayerState, Snapshot},
     settings::Settings,
     songs::Song,
@@ -147,6 +147,9 @@ pub struct App {
     /// late download for an earlier track is dropped instead of shown.
     pub cover: Option<Cover>,
     pub cover_url: Option<String>,
+    /// Cover detail for this session: the saved setting, or
+    /// `RADIO_RECORD_COVER` when the main loop finds it set.
+    pub cover_mode: CoverMode,
     /// Wall-clock time (Unix seconds) filled by the main loop, for track progress.
     pub clock: i64,
     /// Motion mode, resolved once by the main loop; still (`Off`) in tests.
@@ -169,6 +172,7 @@ pub struct Progress {
 
 impl App {
     pub fn new(settings: Settings) -> Self {
+        let cover_mode = settings.cover;
         Self {
             account: crate::account::Account::default(),
             catalog: None,
@@ -195,6 +199,7 @@ impl App {
             playback: Snapshot::default(),
             cover: None,
             cover_url: None,
+            cover_mode,
             clock: 0,
             fx: crate::fx::Fx::Off,
             track_since: None,
@@ -427,7 +432,7 @@ impl App {
                     self.vault.armed = Some(key);
                 }
             }
-            KeyCode::Char('-' | '=' | '+' | ' ' | 's' | 'l' | 'r' | 'q' | '?' | 'd') => {
+            KeyCode::Char('-' | '=' | '+' | ' ' | 's' | 'l' | 'r' | 'q' | '?' | 'd' | 'c') => {
                 return None;
             }
             _ => {}
@@ -499,6 +504,9 @@ impl App {
     /// The cover URL the panel needs but has not requested yet.
     /// The larger cover is preferred so sharp terminal pictures stay crisp.
     pub fn wanted_cover(&self) -> Option<&str> {
+        if self.cover_mode == CoverMode::Off {
+            return None;
+        }
         let track = self.history.first()?;
         let url = [track.image200.as_str(), track.image100.as_str()]
             .into_iter()
@@ -710,7 +718,7 @@ impl App {
         if self.help {
             match key.code {
                 KeyCode::Down | KeyCode::Char('j') => {
-                    self.help_scroll = (self.help_scroll + 1).min(16)
+                    self.help_scroll = (self.help_scroll + 1).min(17)
                 }
                 KeyCode::Up | KeyCode::Char('k') => {
                     self.help_scroll = self.help_scroll.saturating_sub(1)
@@ -765,6 +773,15 @@ impl App {
             KeyCode::End => self.navigate(isize::MAX),
             KeyCode::Char('i') => {
                 self.show_history = !self.show_history;
+            }
+            KeyCode::Char('c') => {
+                self.cover_mode = self.cover_mode.next();
+                self.settings.cover = self.cover_mode;
+                self.dirty = true;
+                self.notify(
+                    format!("▣ COVER {}", self.cover_mode.name().to_uppercase()),
+                    true,
+                );
             }
             KeyCode::Char('f') => {
                 if let Some(id) = self.selected_station().map(|station| station.id) {
@@ -1153,6 +1170,35 @@ pub mod tests {
         );
         app.history[0].time = 0;
         assert_eq!(app.progress(), None, "unknown start time");
+    }
+
+    #[test]
+    fn c_cycles_the_cover_mode_saves_it_and_off_skips_the_download() {
+        let mut app = fixture();
+        press(&mut app, KeyCode::Enter);
+        let id = app.now.as_ref().unwrap().id;
+        app.set_history(id, vec![track(1, "https://example.com/a.jpg")]);
+        assert_eq!(app.cover_mode, CoverMode::Pixel);
+        press(&mut app, KeyCode::Char('c'));
+        assert_eq!(
+            (app.cover_mode, app.settings.cover, app.dirty),
+            (CoverMode::Fine, CoverMode::Fine, true)
+        );
+        assert_eq!(app.active_toast().unwrap().text, "▣ COVER FINE");
+        press(&mut app, KeyCode::Char('c'));
+        press(&mut app, KeyCode::Char('c'));
+        assert_eq!(app.cover_mode, CoverMode::Off);
+        assert_eq!(app.wanted_cover(), None, "off downloads nothing");
+        press(&mut app, KeyCode::Char('c'));
+        assert_eq!(app.cover_mode, CoverMode::Chunky);
+        assert_eq!(app.wanted_cover(), Some("https://example.com/a.jpg"));
+        press(&mut app, KeyCode::Char('v'));
+        press(&mut app, KeyCode::Char('c'));
+        assert_eq!(
+            app.cover_mode,
+            CoverMode::Pixel,
+            "the vault list passes c through"
+        );
     }
 
     #[test]

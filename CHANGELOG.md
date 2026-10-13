@@ -2,6 +2,21 @@
 
 All notable changes to this project are documented here.
 
+## [v3.3.0] - 2026-10-13
+
+### Added
+
+- Cover detail modes on `c`: `off`, `chunky` (7 × 7 blocks), `pixel`
+  (half-blocks, the default), `fine` (two-color quadrant blocks, 28 × 14), and
+  `sharp` (real pictures). The mode is saved as `"cover"` in `settings.json`;
+  `off` skips the download and gives the cover's room to the details.
+
+### Changed
+
+- `RADIO_RECORD_COVER` accepts every mode and overrides the saved one for a
+  session. `sharp` asks the terminal for a picture protocol the first time it
+  is on, so it can now be switched on without a restart.
+
 ## [v3.2.0] - 2026-10-11
 
 ### Added

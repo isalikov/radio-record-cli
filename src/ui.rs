@@ -1,7 +1,7 @@
 use crate::{
     account::{Choice, merge},
     app::{App, Category},
-    cover::Cover,
+    cover::{Cover, CoverMode},
     fx,
     player::{PlayerState, STREAM_ROUNDS},
     songs::Service,
@@ -218,25 +218,27 @@ pub fn theme_from_env() -> Theme {
     Theme::resolve(no_color, Some(name))
 }
 
-/// Cover drawing mode from `RADIO_RECORD_COVER`: `pixel` (default) draws
-/// half-block pixel art everywhere; `sharp` asks the terminal for a picture
-/// protocol (kitty, sixel, iTerm2). Read before the terminal takes over.
-pub fn sharp_covers_from_env() -> bool {
+/// Cover mode from `RADIO_RECORD_COVER`, which overrides the saved setting
+/// for this session; `None` when unset or unknown (with a note on stderr).
+/// Read before the terminal takes over.
+pub fn cover_mode_from_env() -> Option<CoverMode> {
     let value = std::env::var("RADIO_RECORD_COVER").unwrap_or_default();
     match value.trim() {
-        "sharp" => true,
-        "" | "pixel" => false,
-        other => {
-            eprintln!("radio-record: unknown RADIO_RECORD_COVER '{other}', using pixel");
-            false
-        }
+        "" => None,
+        name => CoverMode::parse(name).or_else(|| {
+            eprintln!("radio-record: unknown RADIO_RECORD_COVER '{name}', using the saved setting");
+            None
+        }),
     }
 }
 
 /// Terminal picture support for sharp covers. Without a picker (the default,
-/// and in tests) every cover is drawn in half-blocks by `CoverArt`.
+/// and in tests) every cover is drawn in cells by `CoverArt`.
 #[derive(Default)]
 pub struct Graphics {
+    /// Whether the terminal was asked; it is asked once per session, the
+    /// first time the `sharp` mode is on.
+    pub queried: bool,
     picker: Option<Picker>,
     /// The encoded picture for one cover URL at one size; rebuilt only when
     /// either changes, never per frame.
@@ -253,6 +255,7 @@ impl Graphics {
             .ok()
             .filter(|picker| picker.protocol_type() != ProtocolType::Halfblocks);
         Self {
+            queried: true,
             picker,
             cached: None,
         }
@@ -302,7 +305,7 @@ pub fn render(frame: &mut Frame, app: &mut App, theme: &Theme, graphics: &mut Gr
     let [header_area, inner] = Layout::vertical([Constraint::Length(1), Constraint::Min(1)])
         .areas(area.inner(Margin::new(1, 0)));
     header(frame, app, header_area, theme);
-    let panel = Panel::fit(inner.height, inner.width);
+    let panel = Panel::fit(inner.height, inner.width, app.cover_mode != CoverMode::Off);
     let footer_height = match panel {
         Some(panel) => panel.height(),
         // Small terminals keep the compact footer: visualizer row(s) + 3 lines.
@@ -812,7 +815,10 @@ fn sparkline(history: &VecDeque<f64>, width: usize) -> String {
 /// beside them at full cover height (or below them when the panel is narrow).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Panel {
+    /// Rows of the cover, and of the details beside it.
     cover_rows: u16,
+    /// Columns of the cover: twice its rows, or zero when covers are off.
+    cover_cols: u16,
     /// Visualizer rows under the cover; zero when it sits beside the details.
     below_rows: u16,
 }
@@ -825,16 +831,18 @@ const SIDE_VISUALIZER: u16 = 16;
 
 impl Panel {
     /// The largest panel that still leaves the station list room, if any.
-    fn fit(height: u16, width: u16) -> Option<Self> {
+    fn fit(height: u16, width: u16, cover: bool) -> Option<Self> {
         let cover_rows = match height {
             30.. => 7,
             20.. => 5,
             _ => return None,
         };
-        // Borders, a padding column, the cover, gaps, details, visualizer.
-        let side = width >= 2 + 1 + cover_rows * 2 + 2 + DETAILS_MIN + 2 + SIDE_VISUALIZER;
+        let cover_cols = if cover { cover_rows * 2 + 2 } else { 0 };
+        // Borders, a padding column, the cover and its gap, details, visualizer.
+        let side = width >= 2 + 1 + cover_cols + DETAILS_MIN + 2 + SIDE_VISUALIZER;
         Some(Self {
             cover_rows,
+            cover_cols: cover_cols.saturating_sub(2),
             below_rows: if side { 0 } else { 2 },
         })
     }
@@ -916,18 +924,27 @@ fn now_playing(
         return;
     }
     let cover =
-        Rect::new(inner.x + 1, inner.y, panel.cover_rows * 2, panel.cover_rows).intersection(inner);
-    // Terminal pictures sit above the text layer, so popups would not cover
-    // them: any open overlay switches back to half-blocks, which it can cover.
-    let overlay = app.help || app.show_diag || app.account.open || app.vault.detail.is_some();
-    let sharp = match &app.cover {
-        Some(art) if theme.colorful() && !overlay => graphics.draw(frame, art, cover),
-        _ => false,
+        Rect::new(inner.x + 1, inner.y, panel.cover_cols, panel.cover_rows).intersection(inner);
+    let text_x = if panel.cover_cols == 0 {
+        inner.x + 1
+    } else {
+        // Terminal pictures sit above the text layer, so popups would not
+        // cover them: any open overlay switches back to half-blocks.
+        let overlay = app.help || app.show_diag || app.account.open || app.vault.detail.is_some();
+        let sharp = match &app.cover {
+            Some(art) if app.cover_mode == CoverMode::Sharp && theme.colorful() && !overlay => {
+                graphics.draw(frame, art, cover)
+            }
+            _ => false,
+        };
+        if !sharp {
+            frame.render_widget(
+                CoverArt::new(app.cover.as_ref(), app.cover_mode, theme),
+                cover,
+            );
+        }
+        cover.right() + 2
     };
-    if !sharp {
-        frame.render_widget(CoverArt::new(app.cover.as_ref(), theme), cover);
-    }
-    let text_x = cover.right() + 2;
     let room = inner.right().saturating_sub(text_x + 1);
     let (details_width, visualizer) = if panel.below_rows == 0 {
         let width = room
@@ -1251,18 +1268,82 @@ fn buttons(app: &App, theme: &Theme) -> Vec<Span<'static>> {
     ]
 }
 
-/// The cover in half-blocks: each cell shows two pixels, the top one as the
-/// foreground of "▀" and the bottom one as its background. Without a cover
-/// (or colors) it draws a quiet placeholder note.
+/// The cover drawn in cells, as coarse as its mode asks. `Pixel` (and
+/// `Sharp` without a picture) uses half-blocks: each cell shows two pixels,
+/// the top one as the foreground of "▀" and the bottom one as its
+/// background. `Chunky` paints one pixel per two cells; `Fine` splits each
+/// cell into quadrants and picks the two colors and the quadrant glyph that
+/// fit its four pixels best. Without a cover (or colors) it draws a quiet
+/// placeholder note.
 struct CoverArt<'a> {
     cover: Option<&'a Cover>,
+    mode: CoverMode,
     theme: &'a Theme,
 }
 
 impl<'a> CoverArt<'a> {
-    fn new(cover: Option<&'a Cover>, theme: &'a Theme) -> Self {
-        Self { cover, theme }
+    fn new(cover: Option<&'a Cover>, mode: CoverMode, theme: &'a Theme) -> Self {
+        Self { cover, mode, theme }
     }
+}
+
+/// Quadrant glyphs by the mask of foreground quadrants (1 top left, 2 top
+/// right, 4 bottom left, 8 bottom right). Only masks with the top-left bit
+/// are used: the complement is the same split with the colors swapped. The
+/// full block comes first so a flat cell keeps it on a tie.
+const QUADRANTS: [(u8, &str); 8] = [
+    (15, "█"),
+    (1, "▘"),
+    (3, "▀"),
+    (5, "▌"),
+    (7, "▛"),
+    (9, "▚"),
+    (11, "▜"),
+    (13, "▙"),
+];
+
+/// The best two-color quadrant rendering of four pixels (top left, top
+/// right, bottom left, bottom right): the glyph, its foreground, and its
+/// background, each color the mean of its group.
+fn quadrant(pixels: [[u8; 3]; 4]) -> (&'static str, [u8; 3], [u8; 3]) {
+    let mean = |mask: u8, inside: bool| {
+        let mut sum = [0u32; 3];
+        let mut count = 0;
+        for (index, pixel) in pixels.iter().enumerate() {
+            if (mask >> index & 1 == 1) == inside {
+                for (total, channel) in sum.iter_mut().zip(pixel) {
+                    *total += u32::from(*channel);
+                }
+                count += 1;
+            }
+        }
+        sum.map(|total| total.checked_div(count).unwrap_or(0) as u8)
+    };
+    let error = |mask: u8, fg: [u8; 3], bg: [u8; 3]| -> u32 {
+        pixels
+            .iter()
+            .enumerate()
+            .map(|(index, pixel)| {
+                let color = if mask >> index & 1 == 1 { fg } else { bg };
+                pixel
+                    .iter()
+                    .zip(color)
+                    .map(|(a, b)| u32::from(a.abs_diff(b)).pow(2))
+                    .sum::<u32>()
+            })
+            .sum()
+    };
+    QUADRANTS
+        .iter()
+        .map(|&(mask, glyph)| {
+            let fg = mean(mask, true);
+            // The full block has no background pixels; repeat the foreground.
+            let bg = if mask == 15 { fg } else { mean(mask, false) };
+            (error(mask, fg, bg), glyph, fg, bg)
+        })
+        .min_by_key(|(error, ..)| *error)
+        .map(|(_, glyph, fg, bg)| (glyph, fg, bg))
+        .unwrap_or(("█", pixels[0], pixels[0]))
 }
 
 impl Widget for CoverArt<'_> {
@@ -1277,16 +1358,52 @@ impl Widget for CoverArt<'_> {
                 .set_fg(self.theme.muted);
             return;
         };
-        let pixels = cover.sample(area.width, area.height * 2);
-        let width = usize::from(area.width);
         let color = |[r, g, b]: [u8; 3]| Color::Rgb(r, g, b);
-        for row in 0..area.height {
-            for column in 0..area.width {
-                let top = usize::from(row) * 2 * width + usize::from(column);
-                buf[(area.x + column, area.y + row)]
-                    .set_symbol("▀")
-                    .set_fg(color(pixels[top]))
-                    .set_bg(color(pixels[top + width]));
+        match self.mode {
+            CoverMode::Chunky => {
+                let width = area.width.div_ceil(2);
+                let pixels = cover.sample(width, area.height);
+                for row in 0..area.height {
+                    for column in 0..area.width {
+                        let pixel = pixels[usize::from(row * width + column / 2)];
+                        buf[(area.x + column, area.y + row)]
+                            .set_symbol(" ")
+                            .set_bg(color(pixel));
+                    }
+                }
+            }
+            CoverMode::Fine => {
+                let width = usize::from(area.width) * 2;
+                let pixels = cover.sample(area.width * 2, area.height * 2);
+                for row in 0..area.height {
+                    for column in 0..area.width {
+                        let top = usize::from(row) * 2 * width + usize::from(column) * 2;
+                        let bottom = top + width;
+                        let (glyph, fg, bg) = quadrant([
+                            pixels[top],
+                            pixels[top + 1],
+                            pixels[bottom],
+                            pixels[bottom + 1],
+                        ]);
+                        buf[(area.x + column, area.y + row)]
+                            .set_symbol(glyph)
+                            .set_fg(color(fg))
+                            .set_bg(color(bg));
+                    }
+                }
+            }
+            _ => {
+                let pixels = cover.sample(area.width, area.height * 2);
+                let width = usize::from(area.width);
+                for row in 0..area.height {
+                    for column in 0..area.width {
+                        let top = usize::from(row) * 2 * width + usize::from(column);
+                        buf[(area.x + column, area.y + row)]
+                            .set_symbol("▀")
+                            .set_fg(color(pixels[top]))
+                            .set_bg(color(pixels[top + width]));
+                    }
+                }
             }
         }
     }
@@ -1952,7 +2069,7 @@ fn account(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
 
 fn help(frame: &mut Frame, area: Rect, scroll: u16, theme: &Theme) {
     let width = 52.min(area.width.saturating_sub(4));
-    let height = 21.min(area.height);
+    let height = 22.min(area.height);
     let popup = Rect::new(
         area.x + (area.width - width) / 2,
         area.y + (area.height - height) / 2,
@@ -1972,6 +2089,7 @@ fn help(frame: &mut Frame, area: Rect, scroll: u16, theme: &Theme) {
         ("v", "track vault: liked songs"),
         ("Esc", "close"),
         ("i", "toggle history"),
+        ("c", "cover detail, off to sharp"),
         ("d", "diagnostics"),
         ("a", "account / sync favorites"),
         ("PgUp PgDn Home End", "scroll"),
@@ -1990,14 +2108,14 @@ fn help(frame: &mut Frame, area: Rect, scroll: u16, theme: &Theme) {
     frame.render_widget(
         Paragraph::new(lines)
             .scroll((
-                scroll.min(17u16.saturating_sub(height.saturating_sub(4))),
+                scroll.min(18u16.saturating_sub(height.saturating_sub(4))),
                 0,
             ))
             .style(Style::default().fg(theme.fg).bg(theme.bg))
             .block(
                 Block::default()
                     .title(" Keys ")
-                    .title_bottom(if height < 21 {
+                    .title_bottom(if height < 22 {
                         " ↑↓  ? / Esc "
                     } else {
                         " ? / Esc "
@@ -2574,6 +2692,63 @@ mod tests {
     }
 
     #[test]
+    fn every_cover_mode_draws_at_its_own_detail() {
+        let theme = Theme::default();
+        let orange = |cell: &ratatui::buffer::Cell, color: Color| {
+            matches!(color, Color::Rgb(r, g, b) if r > 240 && (110..130).contains(&g) && b < 40)
+                && !cell.symbol().is_empty()
+        };
+        let quadrants: Vec<&str> = QUADRANTS.iter().map(|(_, glyph)| *glyph).collect();
+        for (mode, glyphs) in [
+            (CoverMode::Chunky, vec![" "]),
+            (CoverMode::Pixel, vec!["▀"]),
+            // The resize filter may shift a channel by one step, so a flat
+            // cell can still split.
+            (CoverMode::Fine, quadrants),
+            (CoverMode::Sharp, vec!["▀"]),
+        ] {
+            let mut app = playing_app();
+            app.cover_mode = mode;
+            app.cover = Some(crate::cover::tests::cover("https://example.com/a.jpg"));
+            let mut terminal = Terminal::new(TestBackend::new(80, 40)).unwrap();
+            terminal
+                .draw(|frame| render(frame, &mut app, &theme, &mut Graphics::default()))
+                .unwrap();
+            let art = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .filter(|cell| glyphs.contains(&cell.symbol()) && orange(cell, cell.bg))
+                .count();
+            assert_eq!(art, 14 * 7, "{mode:?} fills the 14 × 7 cover");
+        }
+        let mut app = playing_app();
+        app.cover_mode = CoverMode::Off;
+        app.cover = Some(crate::cover::tests::cover("https://example.com/a.jpg"));
+        let mut terminal = Terminal::new(TestBackend::new(80, 40)).unwrap();
+        terminal
+            .draw(|frame| render(frame, &mut app, &theme, &mut Graphics::default()))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        assert!(
+            !buffer.content().iter().any(|cell| orange(cell, cell.bg)),
+            "off draws no cover"
+        );
+        assert!(cell_text(buffer).contains("Song"));
+    }
+
+    #[test]
+    fn quadrants_pick_the_split_that_fits_four_pixels() {
+        let (red, blue) = ([255, 0, 0], [0, 0, 255]);
+        assert_eq!(quadrant([red, blue, red, blue]), ("▌", red, blue));
+        assert_eq!(quadrant([red, red, blue, blue]), ("▀", red, blue));
+        assert_eq!(quadrant([blue, red, red, blue]), ("▚", blue, red));
+        assert_eq!(quadrant([red, red, red, blue]), ("▛", red, blue));
+        assert_eq!(quadrant([red; 4]).0, "█");
+    }
+
+    #[test]
     fn the_panel_shows_a_placeholder_without_art_or_colors() {
         for theme in [Theme::default(), Theme::plain()] {
             let mut app = playing_app();
@@ -2609,10 +2784,12 @@ mod tests {
         let mut picker = Picker::halfblocks();
         picker.set_protocol_type(ProtocolType::Kitty);
         let mut graphics = Graphics {
+            queried: true,
             picker: Some(picker),
             cached: None,
         };
         let mut app = playing_app();
+        app.cover_mode = CoverMode::Sharp;
         app.cover = Some(crate::cover::tests::cover("https://example.com/a.jpg"));
         let mut terminal = Terminal::new(TestBackend::new(80, 40)).unwrap();
         let halfblocks = |terminal: &Terminal<TestBackend>| {
@@ -2674,14 +2851,20 @@ mod tests {
 
     #[test]
     fn panel_fits_the_visualizer_beside_or_below_the_details() {
-        let wide = Panel::fit(39, 123).unwrap();
+        let wide = Panel::fit(39, 123, true).unwrap();
         assert_eq!((wide.cover_rows, wide.below_rows, wide.height()), (7, 0, 9));
-        let narrow = Panel::fit(23, 60).unwrap();
+        let narrow = Panel::fit(23, 60, true).unwrap();
         assert_eq!(
             (narrow.cover_rows, narrow.below_rows, narrow.height()),
             (5, 2, 9)
         );
-        assert_eq!(Panel::fit(19, 200), None);
+        assert_eq!(Panel::fit(19, 200, true), None);
+        let bare = Panel::fit(39, 60, false).unwrap();
+        assert_eq!(
+            (bare.cover_cols, bare.below_rows),
+            (0, 0),
+            "without a cover the visualizer fits beside the details"
+        );
         let volume: String = volume_meter(65, &Theme::default())
             .iter()
             .map(|span| span.content.as_ref())

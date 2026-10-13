@@ -15,7 +15,7 @@ mod ui;
 
 use api::{Catalog, Client, Track};
 use app::{Action, App};
-use cover::Cover;
+use cover::{Cover, CoverMode};
 use crossterm::event::{self, Event, KeyEvent, KeyEventKind, KeyModifiers};
 use error::{Error, Result};
 use player::Player;
@@ -185,15 +185,13 @@ fn run() -> Result<()> {
     network.account.restore(&mut app);
     network.catalog(&mut app);
     let theme = ui::theme_from_env();
-    let sharp_covers = ui::sharp_covers_from_env();
+    if let Some(mode) = ui::cover_mode_from_env() {
+        app.cover_mode = mode;
+    }
     app.fx = fx::from_env();
     let mut terminal = ratatui::try_init()?;
     let _guard = TerminalGuard;
-    let mut graphics = if sharp_covers {
-        ui::Graphics::query()
-    } else {
-        ui::Graphics::default()
-    };
+    let mut graphics = ui::Graphics::default();
     crossterm::execute!(io::stdout(), event::EnableBracketedPaste)?;
     let mut last_frame = Instant::now();
     let mut last_save = Instant::now();
@@ -217,6 +215,12 @@ fn run() -> Result<()> {
         for key in media.poll() {
             let action = app.key(KeyEvent::new(key, KeyModifiers::NONE));
             dispatch(action, &mut app, &mut player, &mut network);
+        }
+        // The terminal is asked for a picture protocol once, the first time
+        // `sharp` is on: at startup before any event is read, or right after
+        // the key that switched to it.
+        if app.cover_mode == CoverMode::Sharp && !graphics.queried {
+            graphics = ui::Graphics::query();
         }
         if last_frame.elapsed() >= Duration::from_millis(50) {
             app.push_meter_sample();
