@@ -272,10 +272,19 @@ impl Graphics {
             .as_ref()
             .is_some_and(|(url, cached, _)| *url == cover.url && *cached == area);
         if !fresh {
-            let image = image::DynamicImage::ImageRgb8(cover.image.clone());
+            // Cells are not square in pixels, so a square cover fitted into
+            // the area leaves a gap at one side. Crop it to the area's pixel
+            // shape first (like the half-block modes, which fill every cell),
+            // then scale, which also enlarges covers smaller than the area.
+            let font = picker.font_size();
+            let image = fill_crop(
+                &cover.image,
+                u32::from(area.width) * u32::from(font.width),
+                u32::from(area.height) * u32::from(font.height),
+            );
             let filter = image::imageops::FilterType::Triangle;
             self.cached = picker
-                .new_protocol(image, area.as_size(), Resize::Fit(Some(filter)))
+                .new_protocol(image, area.as_size(), Resize::Scale(Some(filter)))
                 .ok()
                 .map(|protocol| (cover.url.clone(), area, protocol));
         }
@@ -287,6 +296,28 @@ impl Graphics {
             _ => false,
         }
     }
+}
+
+/// The centered part of `image` with the aspect ratio of `width × height`.
+fn fill_crop(image: &image::RgbImage, width: u32, height: u32) -> image::DynamicImage {
+    let (w, h) = image.dimensions();
+    if width == 0 || height == 0 || w == 0 || h == 0 {
+        return image::DynamicImage::ImageRgb8(image.clone());
+    }
+    let (crop_w, crop_h) = if u64::from(w) * u64::from(height) > u64::from(h) * u64::from(width) {
+        (
+            (u64::from(h) * u64::from(width) / u64::from(height)).max(1) as u32,
+            h,
+        )
+    } else {
+        (
+            w,
+            (u64::from(w) * u64::from(height) / u64::from(width)).max(1) as u32,
+        )
+    };
+    let cropped =
+        image::imageops::crop_imm(image, (w - crop_w) / 2, (h - crop_h) / 2, crop_w, crop_h);
+    image::DynamicImage::ImageRgb8(cropped.to_image())
 }
 
 pub fn render(frame: &mut Frame, app: &mut App, theme: &Theme, graphics: &mut Graphics) {
@@ -2776,6 +2807,18 @@ mod tests {
             .unwrap();
         let text = cell_text(terminal.backend().buffer());
         assert!(text.contains("♫ music.sh") && text.contains("Stopped"));
+    }
+
+    #[test]
+    fn sharp_covers_are_cropped_to_the_area_shape() {
+        let square = image::RgbImage::new(600, 600);
+        // 14×7 cells of 16×29 pixels: wider than tall, so trim top and bottom.
+        let wide = fill_crop(&square, 14 * 16, 7 * 29);
+        assert_eq!((wide.width(), wide.height()), (600, 543));
+        let tall = fill_crop(&square, 100, 200);
+        assert_eq!((tall.width(), tall.height()), (300, 600));
+        let same = fill_crop(&square, 0, 10);
+        assert_eq!((same.width(), same.height()), (600, 600));
     }
 
     #[test]

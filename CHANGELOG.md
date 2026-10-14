@@ -2,6 +2,14 @@
 
 All notable changes to this project are documented here.
 
+## [v3.3.1] - 2026-10-14
+
+### Fixed
+
+- `sharp` covers fill the whole cover area like the other modes: the picture
+  is center-cropped to the area's pixel shape and scaled up, instead of fitted
+  square with a gap at the side.
+
 ## [v3.3.0] - 2026-10-13
 
 ### Added
