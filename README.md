@@ -29,7 +29,7 @@
 ## Quick start
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/isalikov/radio-record-cli/master/scripts/install.sh | sh
+curl -fsSL https://dwnl.cc/install-radio-record-cli | sh
 radio-record
 ```
 
@@ -61,7 +61,7 @@ acid yellow marks buffering and faults.
 Once release archives are published, users can install with one command:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/isalikov/radio-record-cli/master/scripts/install.sh | sh
+curl -fsSL https://dwnl.cc/install-radio-record-cli | sh
 ```
 
 The script downloads the latest GitHub Release for the current macOS or Linux
@@ -78,7 +78,7 @@ HTTP, TLS, and AAC decoding are built in.
 ## Uninstall
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/isalikov/radio-record-cli/master/scripts/uninstall.sh | sh
+curl -fsSL https://dwnl.cc/uninstall-radio-record-cli | sh
 ```
 
 This removes `~/.local/bin/radio-record` (or `$RADIO_RECORD_PREFIX/bin/radio-record` if you installed
@@ -87,7 +87,7 @@ pass `--purge` when running the script directly, or set `RADIO_RECORD_PURGE=1` w
 it from curl:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/isalikov/radio-record-cli/master/scripts/uninstall.sh | RADIO_RECORD_PURGE=1 sh
+curl -fsSL https://dwnl.cc/uninstall-radio-record-cli | RADIO_RECORD_PURGE=1 sh
 ```
 
 Settings live in `~/.config/radio-record` by default; the script honours the same
