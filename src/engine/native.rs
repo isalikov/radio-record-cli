@@ -1,4 +1,5 @@
-//! The native audio engine: pure-Rust decode (Symphonia AAC-LC over ADTS)
+//! The native audio engine: pure-Rust decode (Symphonia AAC-LC over ADTS;
+//! HE-AAC streams play as their AAC-LC core at half the sample rate)
 //! feeding an SPSC ring that a cpal output callback drains. No external
 //! processes or system packages; on Linux the only runtime dependency is
 //! libasound (loaded by cpal).
@@ -17,9 +18,13 @@
 //!
 //! During pause the reader drains the stream and the callback clears queued
 //! samples. Resume buffers fresh audio; HLS rejoins recent published segments.
+//!
+//! The ring is the cushion against network dips. Icecast sends a burst of
+//! about 64 KB on connect and HLS joins `HLS_JOIN_SECONDS` behind the live
+//! edge, so both fill it faster than real time without delaying the start.
 
-use crate::api::{Stream, StreamKind};
-use crate::engine::{EngineImpl, native_plays};
+use crate::api::Stream;
+use crate::engine::EngineImpl;
 use crate::error::{Error, Result};
 use crate::player::{AudioMeter, Failure, PlayerState, Snapshot, Streams};
 use crate::spectrum::{Analyzer, FFT_SIZE};
@@ -38,8 +43,16 @@ use symphonia::core::errors::Error as SymphError;
 use symphonia::core::formats::{FormatOptions, FormatReader, TrackType};
 use symphonia::core::io::{MediaSourceStream, ReadOnlySource};
 
-// Fixed capacity: 3 seconds of 48 kHz stereo, 1.5 seconds at 96 kHz.
-const RING_CAPACITY: usize = 48_000 * 2 * 3;
+// Fixed capacity: 20 seconds of 48 kHz stereo, about 22 at 44.1 kHz and 43
+// for the 22.05 kHz core of an HE-AAC stream.
+const RING_CAPACITY: usize = 48_000 * 2 * 20;
+// How far behind the live edge HLS joins; that backlog becomes the cushion.
+const HLS_JOIN_SECONDS: f64 = 15.0;
+// Playback starts after this much audio, and after a pause.
+const START_SECONDS: f64 = 0.3;
+// After the ring runs dry it waits for more, so a struggling connection gives
+// fewer, longer pauses instead of constant stutter.
+const REFILL_SECONDS: f64 = 2.0;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 // Idle read timeout for the endless ADTS body; a server that goes quiet for
 // this long fails the URL and the fallback machine moves on.
@@ -76,6 +89,9 @@ pub(crate) struct OutputState {
     paused: AtomicBool,
     pause_epoch: AtomicU64,
     fill: AtomicU32,
+    /// Samples the callback waits for before it plays: the start threshold,
+    /// or the larger refill threshold after an underrun.
+    target_fill: AtomicU32,
     buffering: AtomicBool,
     underruns: AtomicU32,
     left_db: AtomicU32,
@@ -97,6 +113,7 @@ impl OutputState {
             paused: AtomicBool::new(false),
             pause_epoch: AtomicU64::new(0),
             fill: AtomicU32::new(0),
+            target_fill: AtomicU32::new(0),
             buffering: AtomicBool::new(true),
             underruns: AtomicU32::new(0),
             left_db: AtomicU32::new(f32::NEG_INFINITY.to_bits()),
@@ -118,7 +135,7 @@ enum ReaderEvent {
     },
     Bitrate(u64),
     StreamChanged {
-        url: String,
+        stream: Stream,
         round: u32,
         consumer: Consumer<f32>,
     },
@@ -174,14 +191,9 @@ impl EngineImpl for NativeEngine {
         self.scope_seen = 0;
         self.snapshot = Snapshot::default();
         self.events = None;
-        let playable: Vec<Stream> = streams
-            .into_iter()
-            .filter(|stream| native_plays(stream.kind))
-            .collect();
-        if playable.is_empty() {
+        if streams.is_empty() {
             self.snapshot.state = PlayerState::Error;
-            self.snapshot.error =
-                Some("HE-AAC streams are unsupported · select another station".into());
+            self.snapshot.error = Some("No stream available · select another station".into());
             return;
         }
         self.snapshot.state = PlayerState::Buffering;
@@ -192,7 +204,7 @@ impl EngineImpl for NativeEngine {
             my_generation: self.generation.load(Ordering::Relaxed),
             output: self.output.clone(),
         };
-        thread::spawn(move || reader(shared, Streams::new(playable), event_tx));
+        thread::spawn(move || reader(shared, Streams::new(streams), event_tx));
     }
 
     fn pause(&mut self) {
@@ -240,9 +252,12 @@ impl EngineImpl for NativeEngine {
         }
         self.snapshot.underruns = self.output.underruns.load(Ordering::Relaxed);
         let rate = self.snapshot.samplerate.unwrap_or(44_100) as usize;
-        let start_fill = start_fill(rate);
+        let target = match self.output.target_fill.load(Ordering::Relaxed) as usize {
+            0 => fill_for(rate, START_SECONDS),
+            target => target,
+        };
         self.snapshot.buffering = (self.snapshot.state == PlayerState::Buffering)
-            .then_some((fill * 100 / start_fill).min(100) as u8);
+            .then_some((fill * 100 / target).min(100) as u8);
         self.snapshot.cache_seconds = matches!(
             self.snapshot.state,
             PlayerState::Playing | PlayerState::Buffering
@@ -338,6 +353,7 @@ impl NativeEngine {
         self.snapshot.state = PlayerState::Error;
         self.snapshot.error = Some(message);
         self.output.fill.store(0, Ordering::Relaxed);
+        self.output.target_fill.store(0, Ordering::Relaxed);
         self.generation.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -362,7 +378,7 @@ impl NativeEngine {
             }
             ReaderEvent::Bitrate(bitrate) => self.snapshot.bitrate = Some(bitrate),
             ReaderEvent::StreamChanged {
-                url,
+                stream,
                 round,
                 consumer,
             } => {
@@ -376,10 +392,11 @@ impl NativeEngine {
                 self.analyzer.reset();
                 self.scope_seen = self.output.scope_written.load(Ordering::Acquire);
                 self.output.fill.store(0, Ordering::Relaxed);
+                self.output.target_fill.store(0, Ordering::Relaxed);
                 self.output.buffering.store(true, Ordering::Release);
                 self.snapshot = Snapshot {
                     state: PlayerState::Buffering,
-                    stream: Some(url),
+                    stream: Some(stream),
                     stream_round: round,
                     ..Snapshot::default()
                 };
@@ -405,8 +422,9 @@ impl Drop for NativeEngine {
     }
 }
 
-fn start_fill(rate: usize) -> usize {
-    (rate * 3 / 10).max(1) * 2
+/// Interleaved stereo samples in `seconds` of audio at `rate`.
+fn fill_for(rate: usize, seconds: f64) -> usize {
+    ((rate as f64 * seconds) as usize).max(1) * 2
 }
 
 /// All mutable audio state belongs to the callback. This implementation is
@@ -418,6 +436,9 @@ struct OutputCallback {
     output_channels: usize,
     epoch: u64,
     start_fill: usize,
+    refill: usize,
+    /// What the callback waits for now: `start_fill`, or `refill` after an underrun.
+    threshold: usize,
     playing: bool,
     meter_window: usize,
     meter_count: usize,
@@ -435,7 +456,9 @@ impl OutputCallback {
             output,
             resample: Resample::new(rate, device_rate),
             output_channels: 2,
-            start_fill: start_fill(rate as usize),
+            start_fill: fill_for(rate as usize, START_SECONDS),
+            refill: fill_for(rate as usize, REFILL_SECONDS),
+            threshold: fill_for(rate as usize, START_SECONDS),
             playing: false,
             meter_window: (device_rate as usize / 20).max(1),
             meter_count: 0,
@@ -456,10 +479,11 @@ impl OutputCallback {
             self.resample.reset();
             self.epoch = epoch;
             self.playing = false;
+            self.threshold = self.start_fill;
             self.meter_count = 0;
             self.squares = [0.0; 2];
         }
-        if !paused && !self.playing && self.consumer.slots() >= self.start_fill {
+        if !paused && !self.playing && self.consumer.slots() >= self.threshold {
             self.playing = true;
         }
         let gain = self.output.volume.load(Ordering::Relaxed) as f32 / 100.0;
@@ -474,6 +498,7 @@ impl OutputCallback {
                     }
                     None => {
                         self.playing = false;
+                        self.threshold = self.refill;
                         self.meter_count = 0;
                         self.squares = [0.0; 2];
                         starved = true;
@@ -502,6 +527,9 @@ impl OutputCallback {
         self.output
             .fill
             .store(self.consumer.slots() as u32, Ordering::Relaxed);
+        self.output
+            .target_fill
+            .store(self.threshold as u32, Ordering::Relaxed);
         self.output
             .buffering
             .store(!self.playing, Ordering::Release);
@@ -902,13 +930,13 @@ fn reader(shared: ReaderShared, mut streams: Streams, events: Sender<ReaderEvent
         }
         let (mut producer, consumer) = RingBuffer::new(RING_CAPACITY);
         let _ = events.send(ReaderEvent::StreamChanged {
-            url: stream.url.clone(),
+            stream: stream.clone(),
             round: streams.round() + 1,
             consumer,
         });
-        let result = match stream.kind {
-            StreamKind::Hls => run_hls(&stream, &shared, &mut producer, &events),
-            _ => run_adts(&stream, &shared, &mut producer, &events),
+        let result = match stream.kind.hls_codec() {
+            Some(codec) => run_hls(&stream, codec, &shared, &mut producer, &events),
+            None => run_adts(&stream, &shared, &mut producer, &events),
         };
         match result {
             StopReason::Generation => return,
@@ -1131,10 +1159,12 @@ fn get_bytes(http: &ureq::Agent, url: &str) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-/// The HLS variant: fetch the master playlist, pick the AAC-LC variant, then
-/// join the live edge and play segments as they are published.
+/// An HLS stream: fetch the master playlist, pick the variant with `codec`,
+/// then join `HLS_JOIN_SECONDS` behind the live edge and play segments as
+/// they are published.
 fn run_hls(
     stream: &Stream,
+    codec: &str,
     shared: &ReaderShared,
     producer: &mut Producer<f32>,
     events: &Sender<ReaderEvent>,
@@ -1144,8 +1174,8 @@ fn run_hls(
         Ok(text) => text,
         Err(err) => return StopReason::Error(format!("loading failed: {err}")),
     };
-    let Some(media_url) = crate::engine::hls::pick_lc_variant(&master, &stream.url) else {
-        return StopReason::Error("no AAC-LC HLS variant".into());
+    let Some(media_url) = crate::engine::hls::pick_variant(&master, &stream.url, codec) else {
+        return StopReason::Error(format!("no {codec} HLS variant"));
     };
     let mut next_seq: Option<u64> = None;
     let mut pipe: Option<Pipe> = None;
@@ -1153,7 +1183,8 @@ fn run_hls(
     let mut poll_at = Instant::now();
     let mut last_progress = Instant::now();
     let mut pause_epoch = shared.output.pause_epoch.load(Ordering::Acquire);
-    let mut joining = true;
+    // Seconds to drop from the first segment after joining.
+    let mut join_skip: Option<f64> = None;
     let mut bad_segments = 0;
     loop {
         if !shared.alive() {
@@ -1181,16 +1212,16 @@ fn run_hls(
         let epoch = shared.output.pause_epoch.load(Ordering::Acquire);
         if epoch != pause_epoch && !shared.paused() {
             next_seq = None;
-            joining = true;
         }
         pause_epoch = epoch;
         poll_at = Instant::now()
             + Duration::from_secs_f64((playlist.target_duration / 2.0).clamp(1.0, 5.0));
         if next_seq.is_none() {
-            // Two published segments cover the next publication interval.
-            // Starting with only the last 1.5 s would starve before it arrives.
-            let index = playlist.segments.len().saturating_sub(2);
-            next_seq = Some(playlist.media_sequence + index as u64);
+            // The backlog behind the live edge downloads at network speed and
+            // covers the wait for the next published segment and any dips.
+            let (seq, skip) = crate::engine::hls::join_point(&playlist, HLS_JOIN_SECONDS);
+            next_seq = Some(seq);
+            join_skip = Some(skip);
         }
         let wanted = next_seq.unwrap();
         for segment in &playlist.segments {
@@ -1230,13 +1261,10 @@ fn run_hls(
                 send_telemetry(events, &info);
                 pipe = Some(Pipe::new(producer));
             }
-            let start = if joining {
-                samples.len().saturating_sub(info.rate as usize * 3 * 2)
-            } else {
-                0
-            };
+            let start = join_skip.take().map_or(0, |skip| {
+                ((skip * f64::from(info.rate)) as usize * 2).min(samples.len())
+            });
             pipe.as_mut().unwrap().push(&samples[start..], shared);
-            joining = false;
         }
     }
 }
@@ -1447,24 +1475,31 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn he_aac_fixture_does_not_decode_as_full_rate_stereo() {
-        // ADTS can carry an implicit SBR extension. Symphonia may decode its
-        // low-rate core, so native selection must filter the HE stream kinds
-        // and choose only the explicitly LC variant from HLS masters.
+    fn he_aac_streams_decode_their_half_rate_core() {
+        // ADTS signals HE-AAC implicitly: the header describes the AAC-LC
+        // core, and the decoder skips the reconstructed highs (and, for
+        // HE-AACv2, the parametric stereo) it cannot decode.
         let bytes = std::fs::read(fixture_path("record64-he.aacp")).unwrap();
-        match decode_block(&bytes) {
-            Err(_) => {} // The decoder may also reject the unsupported profile.
-            Ok((samples, info)) => {
-                // If it decodes, the result is a half-band core: it must not
-                // look like a proper 44.1 kHz stereo stream.
-                let looks_normal =
-                    info.rate == 44_100 && info.channels == 2 && samples.len() > 44_100;
-                assert!(
-                    !looks_normal,
-                    "an HE-AAC stream decoded as normal audio; the guard is missing"
-                );
-            }
-        }
+        let (samples, info) = decode_block(&bytes).unwrap();
+        assert_eq!((info.rate, info.channels), (22_050, 2));
+        let seconds = samples.len() as f64 / 2.0 / 22_050.0;
+        assert!(
+            (2.0..3.0).contains(&seconds),
+            "20 KB of a 64 kbps stream is about 2.5 s: {seconds}"
+        );
+        assert!(samples.iter().any(|sample| sample.abs() > 0.1));
+        let bytes = std::fs::read(fixture_path("32/l0_hev2.aac")).unwrap();
+        let (samples, info) = decode_block(&bytes).unwrap();
+        assert_eq!(
+            (info.rate, info.channels),
+            (22_050, 1),
+            "the HE-AACv2 core is mono"
+        );
+        assert!(samples.chunks(2).all(|frame| frame[0] == frame[1]));
+        assert!(
+            samples.len() / 2 > 22_050 * 5,
+            "a 6 s segment decodes fully"
+        );
     }
 
     #[test]
@@ -1620,10 +1655,10 @@ pub(crate) mod tests {
         let output = Arc::new(OutputState::new(100));
         let shared = reader_shared(output.clone());
         let (mut producer, consumer) = RingBuffer::new(RING_CAPACITY);
-        // Initial tail followed by a full HLS segment: larger than both the
-        // ring and the old pending limit. Every stereo frame has a unique value.
-        let samples: Vec<f32> = (0..44_100 * 9)
-            .flat_map(|index| [0.1 + index as f32 / 1_000_000.0; 2])
+        // A joined backlog followed by more audio than the ring holds. Every
+        // stereo frame has a unique value.
+        let samples: Vec<f32> = (0..RING_CAPACITY / 2 + 44_100 * 6)
+            .flat_map(|index| [0.1 + index as f32 / 10_000_000.0; 2])
             .collect();
         let expected = samples.clone();
         let (done_tx, done_rx) = mpsc::channel();
@@ -1634,7 +1669,7 @@ pub(crate) mod tests {
             done_tx.send(()).unwrap();
         });
         let deadline = Instant::now() + Duration::from_secs(3);
-        while consumer.slots() < start_fill(44_100) {
+        while consumer.slots() < fill_for(44_100, START_SECONDS) {
             assert!(Instant::now() < deadline, "reader did not fill the ring");
             thread::yield_now();
         }
@@ -1938,34 +1973,88 @@ pub(crate) mod tests {
             engine.snapshot.stream
         );
         let snapshot = engine.snapshot();
-        // The snapshot reports the station's HLS URL (the master playlist),
-        // which ui::stream_label matches against Station::stream_hls.
-        assert!(
-            snapshot
-                .stream
-                .as_deref()
-                .unwrap()
-                .contains("hls-master.m3u8")
-        );
+        // The snapshot reports the station's HLS stream (the master
+        // playlist URL) with its kind, which the panel names on screen.
+        let active = snapshot.stream.as_ref().unwrap();
+        assert_eq!(active.kind, StreamKind::Hls);
+        assert!(active.url.contains("hls-master.m3u8"));
         assert_eq!(snapshot.stream_round, 1, "still the first fallback round");
         assert_eq!(snapshot.codec.as_deref(), Some("aac"));
     }
 
     #[test]
-    fn he_only_lists_are_refused_up_front() {
+    fn low_qualities_play_their_he_aac_core_end_to_end() {
+        // The 32 kbps HLS variant of the real master playlist.
         let mut engine = engine();
-        engine.play(vec![
-            stream(StreamKind::High, "https://example.com/64.aacp"),
-            stream(StreamKind::Low, "https://example.com/32.aacp"),
-        ]);
-        engine.tick().unwrap();
-        let snapshot = engine.snapshot();
-        assert_eq!(snapshot.state, PlayerState::Error);
+        engine.play(vec![stream(
+            StreamKind::HlsHeV2,
+            "fixture://fixtures/hls-master.m3u8",
+        )]);
         assert!(
-            snapshot
-                .error
-                .unwrap()
-                .contains("HE-AAC streams are unsupported")
+            wait_for(&mut engine, 4.0, |engine| {
+                engine.snapshot.state == PlayerState::Playing && engine.snapshot.levels[0] > 0.0
+            }),
+            "state: {:?}, error: {:?}",
+            engine.snapshot.state,
+            engine.snapshot.error
+        );
+        let snapshot = engine.snapshot();
+        assert_eq!(snapshot.samplerate, Some(22_050));
+        assert_eq!(snapshot.channels, Some(1));
+        assert!(snapshot.bitrate.is_some_and(|bitrate| bitrate < 40_000));
+        assert_eq!(snapshot.stream.unwrap().kind, StreamKind::HlsHeV2);
+        // A direct HE-AAC stream plays too.
+        engine.play(vec![stream(StreamKind::Low, "fixture://record64-he.aacp")]);
+        assert!(wait_for(&mut engine, 4.0, |engine| {
+            engine.snapshot.state == PlayerState::Playing
+        }));
+        assert_eq!(engine.snapshot.samplerate, Some(22_050));
+        // Nothing to play is an error, not a silent buffer.
+        engine.play(Vec::new());
+        engine.tick().unwrap();
+        assert_eq!(engine.snapshot.state, PlayerState::Error);
+    }
+
+    #[test]
+    fn an_underrun_waits_for_the_refill_threshold_and_pause_resets_it() {
+        let mut engine = engine();
+        engine.snapshot.samplerate = Some(100);
+        engine.sink = Some(Box::new(TestSink));
+        let (mut producer, consumer) = RingBuffer::new(1024);
+        let mut callback = OutputCallback::new(consumer, engine.output.clone(), 100, 100);
+        let mut buffer = [0.0f32; 20];
+        // 0.3 s starts playback: 30 frames at 100 Hz.
+        producer.push_entire_slice(&[0.5; 60]).unwrap();
+        callback.fill(&mut buffer);
+        engine.tick().unwrap();
+        assert_eq!(engine.snapshot.state, PlayerState::Playing);
+        for _ in 0..3 {
+            callback.fill(&mut buffer);
+        }
+        assert_eq!(engine.output.underruns.load(Ordering::Relaxed), 1);
+        // After the underrun the same 0.3 s is not enough: it waits for 2 s.
+        producer.push_entire_slice(&[0.5; 100]).unwrap();
+        callback.fill(&mut buffer);
+        assert_eq!(buffer, [0.0; 20], "still refilling");
+        engine.tick().unwrap();
+        assert_eq!(engine.snapshot.state, PlayerState::Buffering);
+        assert_eq!(engine.snapshot.buffering, Some(25), "100 of 400 samples");
+        producer.push_entire_slice(&[0.5; 300]).unwrap();
+        callback.fill(&mut buffer);
+        assert!(buffer.iter().all(|sample| *sample > 0.0));
+        // Starve again, then pause and resume: a fresh start needs only 0.3 s.
+        while callback.consumer.slots() > 0 {
+            callback.fill(&mut buffer);
+        }
+        callback.fill(&mut buffer);
+        engine.pause();
+        engine.pause();
+        callback.fill(&mut buffer);
+        producer.push_entire_slice(&[0.5; 60]).unwrap();
+        callback.fill(&mut buffer);
+        assert!(
+            buffer.iter().all(|sample| *sample > 0.0),
+            "start threshold again"
         );
     }
 
@@ -2025,6 +2114,52 @@ pub(crate) mod tests {
             }),
             "resume must return to the live edge"
         );
+    }
+
+    #[test]
+    #[ignore = "requires network access to Radio Record streams"]
+    fn live_low_qualities_play_and_build_a_cushion() {
+        // The 64 and 32 kbps HLS variants and a direct HE-AAC stream play as
+        // their 22.05 kHz core, and the HLS backlog or the Icecast connect
+        // burst fills the ring well past the old three seconds.
+        for (kind, url) in [
+            (
+                StreamKind::HlsHe,
+                "https://hls-01-radiorecord.hostingradio.ru/record/playlist.m3u8",
+            ),
+            (
+                StreamKind::HlsHeV2,
+                "https://hls-01-radiorecord.hostingradio.ru/record/playlist.m3u8",
+            ),
+            (
+                StreamKind::Low,
+                "https://radiorecord.hostingradio.ru/rr_main32.aacp",
+            ),
+        ] {
+            let mut engine = engine();
+            engine.play(vec![stream(kind, url)]);
+            assert!(
+                wait_for(&mut engine, 30.0, |engine| {
+                    engine.snapshot.state == PlayerState::Playing && engine.snapshot.levels[0] > 0.0
+                }),
+                "{kind:?}: state: {:?}, error: {:?}",
+                engine.snapshot.state,
+                engine.snapshot.error
+            );
+            assert_eq!(engine.snapshot.samplerate, Some(22_050), "{kind:?}");
+            assert!(
+                wait_for(&mut engine, 15.0, |engine| {
+                    engine
+                        .snapshot
+                        .cache_seconds
+                        .is_some_and(|seconds| seconds > 8.0)
+                }),
+                "{kind:?}: cushion {:?}",
+                engine.snapshot.cache_seconds
+            );
+            assert_eq!(engine.snapshot.state, PlayerState::Playing);
+            assert_eq!(engine.snapshot.underruns, 0, "{kind:?}");
+        }
     }
 
     #[test]

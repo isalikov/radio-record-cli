@@ -44,7 +44,8 @@ pub struct Snapshot {
     pub bitrate: Option<u64>,
     pub buffering: Option<u8>,
     pub cache_seconds: Option<f64>,
-    pub stream: Option<String>,
+    /// The stream being loaded or played, with the API field it came from.
+    pub stream: Option<Stream>,
     pub stream_round: u32,
     pub underruns: u32,
 }

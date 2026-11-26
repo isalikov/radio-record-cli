@@ -432,7 +432,9 @@ impl App {
                     self.vault.armed = Some(key);
                 }
             }
-            KeyCode::Char('-' | '=' | '+' | ' ' | 's' | 'l' | 'r' | 'q' | '?' | 'd' | 'c') => {
+            KeyCode::Char(
+                '-' | '=' | '+' | ' ' | 's' | 'l' | 'r' | 'q' | '?' | 'd' | 'c' | 'b',
+            ) => {
                 return None;
             }
             _ => {}
@@ -544,6 +546,56 @@ impl App {
         let fraction = (!lengths.is_empty())
             .then(|| (elapsed as f64 / lengths[lengths.len() / 2] as f64).min(1.0));
         Some(Progress { elapsed, fraction })
+    }
+
+    /// The stream the chosen quality plays first on the station on air.
+    pub fn preferred_stream(&self) -> Option<Stream> {
+        self.now
+            .as_ref()?
+            .streams(self.settings.quality)
+            .into_iter()
+            .next()
+    }
+
+    /// Whether the engine fell back from the preferred stream to another one.
+    pub fn on_fallback(&self) -> bool {
+        self.playback.stream.as_ref().is_some_and(|active| {
+            self.preferred_stream()
+                .is_some_and(|preferred| preferred != *active)
+        })
+    }
+
+    /// Step the stream quality down (wrapping to the top) and save it. The
+    /// station on air reconnects at once, unless it already plays the stream
+    /// the new quality prefers.
+    fn switch_quality(&mut self) -> Action {
+        let quality = self.settings.quality.next();
+        self.settings.quality = quality;
+        self.dirty = true;
+        self.notify(
+            format!(
+                "◈ QUALITY {} · {}",
+                quality.name().to_uppercase(),
+                quality.kind().label().to_uppercase()
+            ),
+            true,
+        );
+        let Some(station) = self.now.clone() else {
+            return Action::None;
+        };
+        let wanted = self.preferred_stream();
+        if wanted.is_none()
+            || (self.playback.state != PlayerState::Error && wanted == self.playback.stream)
+        {
+            return Action::None;
+        }
+        // Same station: the track, history, and cover stay on screen.
+        self.error = None;
+        self.playback = Snapshot {
+            state: PlayerState::Buffering,
+            ..Snapshot::default()
+        };
+        Action::Play(station.streams(quality))
     }
 
     pub fn set_worker_stalled(&mut self, stalled: bool) {
@@ -718,7 +770,7 @@ impl App {
         if self.help {
             match key.code {
                 KeyCode::Down | KeyCode::Char('j') => {
-                    self.help_scroll = (self.help_scroll + 1).min(17)
+                    self.help_scroll = (self.help_scroll + 1).min(18)
                 }
                 KeyCode::Up | KeyCode::Char('k') => {
                     self.help_scroll = self.help_scroll.saturating_sub(1)
@@ -774,6 +826,7 @@ impl App {
             KeyCode::Char('i') => {
                 self.show_history = !self.show_history;
             }
+            KeyCode::Char('b') => return self.switch_quality(),
             KeyCode::Char('c') => {
                 self.cover_mode = self.cover_mode.next();
                 self.settings.cover = self.cover_mode;
@@ -862,7 +915,7 @@ impl App {
         let Some(station) = self.selected_station().cloned() else {
             return Action::None;
         };
-        let streams = station.streams();
+        let streams = station.streams(self.settings.quality);
         if streams.is_empty() {
             self.error = Some("No stream available".into());
             return Action::None;
@@ -1199,6 +1252,96 @@ pub mod tests {
             CoverMode::Pixel,
             "the vault list passes c through"
         );
+    }
+
+    fn with_hls(mut app: App) -> App {
+        for station in &mut app.catalog.as_mut().unwrap().stations {
+            station.stream_hls = "https://hls.example.com/playlist.m3u8".into();
+        }
+        app
+    }
+
+    fn first_kind(action: Action) -> Option<crate::api::StreamKind> {
+        match action {
+            Action::Play(streams) => streams.first().map(|stream| stream.kind),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn b_steps_the_quality_down_saves_it_and_reconnects_the_station_on_air() {
+        use crate::api::{Quality, StreamKind};
+        let mut app = with_hls(fixture());
+        assert_eq!(app.settings.quality, Quality::Standard);
+        // Nothing on air: only the preference changes.
+        assert!(matches!(press(&mut app, KeyCode::Char('b')), Action::None));
+        assert_eq!((app.settings.quality, app.dirty), (Quality::Low, true));
+        assert_eq!(app.active_toast().unwrap().text, "◈ QUALITY LOW · HLS 64K");
+        assert_eq!(
+            first_kind(press(&mut app, KeyCode::Enter)),
+            Some(StreamKind::HlsHe),
+            "low quality plays the 64k HLS variant first"
+        );
+        app.playback.state = PlayerState::Playing;
+        app.playback.stream = app.preferred_stream();
+        app.history = vec![track(100, "")];
+        press(&mut app, KeyCode::Down); // Browsing does not pick the station to reconnect.
+        assert_eq!(
+            first_kind(press(&mut app, KeyCode::Char('b'))),
+            Some(StreamKind::HlsHeV2),
+            "the station on air reconnects at 32k"
+        );
+        assert_eq!(
+            app.active_toast().unwrap().text,
+            "◈ QUALITY LOWEST · HLS 32K"
+        );
+        assert_eq!(app.now.as_ref().unwrap().id, 1);
+        assert_eq!(app.playback.state, PlayerState::Buffering);
+        assert_eq!(app.history.len(), 1, "the same station keeps its track");
+        // The lowest quality wraps to the highest.
+        app.playback.state = PlayerState::Playing;
+        app.playback.stream = app.preferred_stream();
+        assert_eq!(
+            first_kind(press(&mut app, KeyCode::Char('b'))),
+            Some(StreamKind::Hls)
+        );
+        assert_eq!(app.settings.quality, Quality::High);
+        // Already on the stream the new quality prefers (after a fallback):
+        // no needless reconnect.
+        app.playback.state = PlayerState::Playing;
+        app.playback.stream = app.catalog.as_ref().unwrap().stations[0]
+            .streams(Quality::Standard)
+            .into_iter()
+            .next();
+        assert!(app.on_fallback());
+        assert!(matches!(press(&mut app, KeyCode::Char('b')), Action::None));
+        assert_eq!(app.settings.quality, Quality::Standard);
+        assert!(!app.on_fallback());
+        // A failed station retries at once.
+        app.playback.state = PlayerState::Error;
+        assert!(matches!(
+            press(&mut app, KeyCode::Char('b')),
+            Action::Play(_)
+        ));
+        assert_eq!(app.settings.quality, Quality::Low);
+        // The vault passes b through.
+        press(&mut app, KeyCode::Char('v'));
+        press(&mut app, KeyCode::Char('b'));
+        assert_eq!(app.settings.quality, Quality::Lowest);
+    }
+
+    #[test]
+    fn a_station_without_the_preferred_stream_plays_what_it_has() {
+        let mut app = fixture();
+        press(&mut app, KeyCode::Char('b'));
+        let Action::Play(streams) = press(&mut app, KeyCode::Enter) else {
+            panic!("the direct stream still plays");
+        };
+        assert_eq!(streams.len(), 1);
+        app.playback.state = PlayerState::Playing;
+        app.playback.stream = Some(streams[0].clone());
+        assert!(!app.on_fallback(), "the only stream is not a fallback");
+        assert!(matches!(press(&mut app, KeyCode::Char('b')), Action::None));
     }
 
     #[test]

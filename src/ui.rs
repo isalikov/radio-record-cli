@@ -15,9 +15,9 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, Clear, List, ListItem, Padding, Paragraph, Widget},
 };
 use ratatui_image::{
-    Image, Resize,
+    FontSize, Image, Resize,
     picker::{Picker, ProtocolType},
-    protocol::Protocol,
+    protocol::{Protocol, iterm2::Iterm2},
 };
 use std::{collections::VecDeque, time::Duration};
 
@@ -251,8 +251,15 @@ impl Graphics {
     /// the event reader swallows the reply. Half-block-only terminals keep
     /// the built-in pixel art.
     pub fn query() -> Self {
+        let iterm2 = ["TERM_PROGRAM", "LC_TERMINAL"]
+            .iter()
+            .any(|name| std::env::var(name).is_ok_and(|value| value.contains("iTerm")));
         let picker = Picker::from_query_stdio()
             .ok()
+            .map(|mut picker| {
+                picker.set_protocol_type(protocol_for(picker.protocol_type(), iterm2));
+                picker
+            })
             .filter(|picker| picker.protocol_type() != ProtocolType::Halfblocks);
         Self {
             queried: true,
@@ -282,11 +289,15 @@ impl Graphics {
                 u32::from(area.width) * u32::from(font.width),
                 u32::from(area.height) * u32::from(font.height),
             );
-            let filter = image::imageops::FilterType::Triangle;
-            self.cached = picker
-                .new_protocol(image, area.as_size(), Resize::Scale(Some(filter)))
-                .ok()
-                .map(|protocol| (cover.url.clone(), area, protocol));
+            let protocol = if picker.protocol_type() == ProtocolType::Iterm2 {
+                iterm2_picture(&image, area, font, picker.tmux_detected())
+            } else {
+                let filter = image::imageops::FilterType::Triangle;
+                picker
+                    .new_protocol(image, area.as_size(), Resize::Scale(Some(filter)))
+                    .ok()
+            };
+            self.cached = protocol.map(|protocol| (cover.url.clone(), area, protocol));
         }
         match &self.cached {
             Some((_, _, protocol)) if protocol.needs_placeholder(area).is_none() => {
@@ -296,6 +307,63 @@ impl Graphics {
             _ => false,
         }
     }
+}
+
+/// The picture protocol to use, given what the terminal query found. iTerm2
+/// (3.6 and later) answers the kitty graphics query, so the query picks kitty,
+/// but ratatui-image draws kitty pictures through unicode placeholders, which
+/// iTerm2 leaves blank: the cover stayed empty. iTerm2 (`TERM_PROGRAM`, or
+/// `LC_TERMINAL` through tmux and ssh) gets its own protocol instead. A
+/// half-block answer stays, since it means the query found no cell size.
+fn protocol_for(detected: ProtocolType, iterm2: bool) -> ProtocolType {
+    match detected {
+        ProtocolType::Kitty | ProtocolType::Sixel if iterm2 => ProtocolType::Iterm2,
+        other => other,
+    }
+}
+
+/// An iTerm2 picture that fills `area`, sized in cells. ratatui-image sizes
+/// iTerm2 pictures in `px`, which iTerm2 reads as device pixels while it
+/// reports the cell size in points, so on Retina screens covers came out at
+/// half size. Cells fit the area on any screen; the picture is sent at twice
+/// the reported cell size so Retina screens get one pixel per device pixel.
+fn iterm2_picture(
+    image: &image::DynamicImage,
+    area: Rect,
+    font: FontSize,
+    tmux: bool,
+) -> Option<Protocol> {
+    let (width, height) = (area.width, area.height);
+    let scaled = image.resize_exact(
+        (u32::from(width) * u32::from(font.width) * 2).max(1),
+        (u32::from(height) * u32::from(font.height) * 2).max(1),
+        image::imageops::FilterType::Triangle,
+    );
+    let mut png = Vec::new();
+    scaled
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .ok()?;
+    let (start, escape, end) = if tmux {
+        ("\x1bPtmux;", "\x1b\x1b", "\x1b\\")
+    } else {
+        ("", "\x1b", "")
+    };
+    // Blank the area first, as ratatui-image does, then draw in place.
+    let mut data = String::from(start);
+    for _ in 0..height {
+        data.push_str(&format!("{escape}[{width}X{escape}[1B"));
+    }
+    data.push_str(&format!(
+        "{escape}[{height}A{escape}]1337;File=inline=1;size={};width={width};height={height};\
+         preserveAspectRatio=0;doNotMoveCursor=1:{}\x07{end}",
+        png.len(),
+        crate::songs::base64(&png),
+    ));
+    Some(Protocol::ITerm2(Iterm2 {
+        data,
+        size: area.as_size(),
+        is_tmux: tmux,
+    }))
 }
 
 /// The centered part of `image` with the aspect ratio of `width × height`.
@@ -671,7 +739,7 @@ fn playback(frame: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     }
     let [status, volume] = Layout::horizontal([Constraint::Min(1), Constraint::Length(5)])
         .areas(Rect::new(area.x, area.y, area.width, 1));
-    let spans = status_spans(app, theme);
+    let spans = status_spans(app, theme, true);
     frame.render_widget(Paragraph::new(Line::from(spans)), status);
     frame.render_widget(
         Paragraph::new(format!("{}%", app.settings.volume))
@@ -710,9 +778,10 @@ fn playback(frame: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     );
 }
 
-/// The playback state symbol and station name, plus telemetry segments while
-/// the diagnostics overlay is open.
-fn status_spans(app: &App, theme: &Theme) -> Vec<Span<'static>> {
+/// The playback state symbol and station name, the active stream when
+/// `with_stream` is set (the compact footer has no telemetry line), plus
+/// telemetry segments while the diagnostics overlay is open.
+fn status_spans(app: &App, theme: &Theme, with_stream: bool) -> Vec<Span<'static>> {
     let symbol = match app.playback.state {
         PlayerState::Idle => "○".to_owned(),
         // Real cache progress while the stream fills; a bare dot until the engine reports progress.
@@ -733,6 +802,16 @@ fn status_spans(app: &App, theme: &Theme) -> Vec<Span<'static>> {
         format!("{symbol}  {name}"),
         Style::default().fg(theme.accent),
     )];
+    if with_stream && let Some(stream) = stream_text(app) {
+        spans.push(Span::styled(
+            format!(" · {stream}"),
+            Style::default().fg(if app.on_fallback() {
+                theme.warn
+            } else {
+                theme.muted
+            }),
+        ));
+    }
     if app.show_diag {
         for segment in telemetry_segments(app) {
             spans.push(Span::styled(
@@ -768,12 +847,10 @@ fn telemetry_segments(app: &App) -> Vec<String> {
     segments
 }
 
+/// `48kHz`, `44.1kHz`, `22.05kHz`: kilohertz without trailing zeros.
 fn samplerate_text(rate: u64) -> String {
-    if rate.is_multiple_of(1000) {
-        format!("{}kHz", rate / 1000)
-    } else {
-        format!("{:.1}kHz", rate as f64 / 1000.0)
-    }
+    let khz = format!("{}.{:03}", rate / 1000, rate % 1000);
+    format!("{}kHz", khz.trim_end_matches('0').trim_end_matches('.'))
 }
 
 fn channels_text(channels: u64) -> String {
@@ -784,26 +861,16 @@ fn channels_text(channels: u64) -> String {
     }
 }
 
-/// Names the URL that is actually playing, using the station's own stream fields
-/// and falling back to the host when the URL is not one of them.
-fn stream_label(app: &App, url: &str) -> String {
-    if let Some(station) = &app.now {
-        for (label, stream) in [
-            ("320k", &station.stream_320),
-            ("HLS", &station.stream_hls),
-            ("128k", &station.stream_128),
-            ("64k", &station.stream_64),
-        ] {
-            if !stream.is_empty() && stream == url {
-                return label.into();
-            }
-        }
-    }
-    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
-    rest.split(['/', ':', '?'])
-        .next()
-        .unwrap_or(rest)
-        .to_owned()
+/// Names the stream being loaded or played, such as `HLS 64k` or
+/// `direct 96k`, with `fallback` when the engine could not load the one the
+/// quality prefers.
+fn stream_text(app: &App) -> Option<String> {
+    let label = app.playback.stream.as_ref()?.kind.label();
+    Some(if app.on_fallback() {
+        format!("{label} fallback")
+    } else {
+        label.to_owned()
+    })
 }
 
 fn age_text(age: Duration) -> String {
@@ -930,7 +997,7 @@ fn now_playing(
         top.push(Span::styled("[LIVE] ", Style::default().fg(theme.alert)));
     }
     let mut bottom = vec![Span::styled("━ ", edge)];
-    bottom.extend(status_spans(app, theme));
+    bottom.extend(status_spans(app, theme, false));
     bottom.push(Span::raw(" "));
     let mut block = Block::default()
         .borders(Borders::ALL)
@@ -1095,8 +1162,9 @@ fn volume_meter(volume: u8, theme: &Theme) -> Vec<Span<'static>> {
     spans
 }
 
-/// `SIG ▂▃▅▇ BUF 2.4s`: four bars lit by how much audio is queued, out of
-/// the ring's three seconds. Absent when nothing is loading or playing.
+/// `SIG ▂▃▅▇ BUF 2.4s`: four bars lit by how much audio is queued, at 0.5,
+/// 2, 5, and 10 seconds: the cushion against network dips. Absent when
+/// nothing is loading or playing.
 fn signal(app: &App, theme: &Theme) -> Vec<Span<'static>> {
     let Some(seconds) = app
         .playback
@@ -1105,7 +1173,10 @@ fn signal(app: &App, theme: &Theme) -> Vec<Span<'static>> {
     else {
         return Vec::new();
     };
-    let lit = ((seconds / 3.0 * 4.0).ceil() as usize).min(4);
+    let lit = [0.5, 2.0, 5.0, 10.0]
+        .iter()
+        .filter(|threshold| seconds >= **threshold)
+        .count();
     let on = if app.playback.state == PlayerState::Buffering {
         theme.warn
     } else {
@@ -1219,7 +1290,8 @@ fn metadata_line(app: &App, theme: &Theme) -> Line<'static> {
     Line::styled(parts.join(" ▪ "), Style::default().fg(theme.muted))
 }
 
-/// `▶ STREAMING :: AAC/44.1KHZ/STEREO/128K` from the engine's telemetry.
+/// `STREAMING :: HLS 112K ▪ AAC/44.1KHZ STEREO/112K`: the active stream and
+/// the engine's telemetry. A fallback stream is named in the warning color.
 fn telemetry_line(app: &App, theme: &Theme) -> Line<'static> {
     let (label, color) = match app.playback.state {
         PlayerState::Playing => ("STREAMING", theme.accent),
@@ -1228,14 +1300,32 @@ fn telemetry_line(app: &App, theme: &Theme) -> Line<'static> {
         PlayerState::Error => ("FAULT", theme.warn),
         PlayerState::Idle => return Line::default(),
     };
-    let mut spans = vec![Span::styled(label, Style::default().fg(color))];
+    let mut values = Vec::new();
+    if let Some(stream) = stream_text(app) {
+        values.push(Span::styled(
+            stream.to_uppercase(),
+            Style::default().fg(if app.on_fallback() {
+                theme.warn
+            } else {
+                theme.accent
+            }),
+        ));
+    }
     let segments = telemetry_segments(app);
     if !segments.is_empty() {
-        spans.push(Span::styled(" :: ", Style::default().fg(theme.edge)));
-        spans.push(Span::styled(
+        if !values.is_empty() {
+            values.push(Span::styled(" ▪ ", Style::default().fg(theme.edge)));
+        }
+        values.push(Span::styled(
             segments.join("/").to_uppercase(),
             Style::default().fg(theme.muted),
         ));
+    }
+    // Narrow panels skip the first two spans and keep only the values.
+    let mut spans = vec![Span::styled(label, Style::default().fg(color))];
+    if !values.is_empty() {
+        spans.push(Span::styled(" :: ", Style::default().fg(theme.edge)));
+        spans.extend(values);
     }
     Line::from(spans)
 }
@@ -2100,7 +2190,7 @@ fn account(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
 
 fn help(frame: &mut Frame, area: Rect, scroll: u16, theme: &Theme) {
     let width = 52.min(area.width.saturating_sub(4));
-    let height = 22.min(area.height);
+    let height = 23.min(area.height);
     let popup = Rect::new(
         area.x + (area.width - width) / 2,
         area.y + (area.height - height) / 2,
@@ -2121,6 +2211,7 @@ fn help(frame: &mut Frame, area: Rect, scroll: u16, theme: &Theme) {
         ("Esc", "close"),
         ("i", "toggle history"),
         ("c", "cover detail, off to sharp"),
+        ("b", "stream quality, 112k → 32k"),
         ("d", "diagnostics"),
         ("a", "account / sync favorites"),
         ("PgUp PgDn Home End", "scroll"),
@@ -2139,14 +2230,14 @@ fn help(frame: &mut Frame, area: Rect, scroll: u16, theme: &Theme) {
     frame.render_widget(
         Paragraph::new(lines)
             .scroll((
-                scroll.min(18u16.saturating_sub(height.saturating_sub(4))),
+                scroll.min(19u16.saturating_sub(height.saturating_sub(4))),
                 0,
             ))
             .style(Style::default().fg(theme.fg).bg(theme.bg))
             .block(
                 Block::default()
                     .title(" Keys ")
-                    .title_bottom(if height < 22 {
+                    .title_bottom(if height < 23 {
                         " ↑↓  ? / Esc "
                     } else {
                         " ? / Esc "
@@ -2180,12 +2271,10 @@ fn diag(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         PlayerState::Error => "error",
     };
     let audio = telemetry_segments(app).join(" · ");
-    let stream = match &app.playback.stream {
-        Some(url) => format!(
-            "{} · round {}/{}",
-            stream_label(app, url),
-            app.playback.stream_round,
-            STREAM_ROUNDS
+    let stream = match stream_text(app) {
+        Some(text) => format!(
+            "{text} · round {}/{}",
+            app.playback.stream_round, STREAM_ROUNDS
         ),
         None => String::new(),
     };
@@ -2464,7 +2553,7 @@ mod tests {
         app.playback.samplerate = Some(44_100);
         app.playback.channels = Some(2);
         app.playback.bitrate = Some(128_000);
-        app.playback.stream = Some("https://example.com/radio".into());
+        app.playback.stream = app.preferred_stream();
         app.playback.stream_round = 2;
         app.generation = 7;
         app.uptime = Duration::from_secs(75);
@@ -2481,7 +2570,11 @@ mod tests {
         assert!(text.contains("Diagnostics"));
         assert!(text.contains("generation 7"));
         assert!(text.contains("aac · 44.1kHz stereo · 128k"));
-        assert!(text.contains("320k · round 2/3"));
+        assert_eq!(
+            [48_000, 44_100, 22_050, 8_000].map(samplerate_text),
+            ["48kHz", "44.1kHz", "22.05kHz", "8kHz"]
+        );
+        assert!(text.contains("direct 96k · round 2/3"));
         assert!(text.contains("updated 3s ago"));
         assert!(text.contains("1:15"), "75 seconds formats as 1:15");
         assert!(text.contains("▄"), "the sparkline records real levels");
@@ -2495,8 +2588,59 @@ mod tests {
         // The status line drops its telemetry segments; the panel's own HUD
         // line keeps showing the stream format in caps.
         assert!(!text.contains("· 128k"));
-        assert!(text.contains("AAC/44.1KHZ STEREO/128K"));
+        assert!(text.contains("DIRECT 96K ▪ AAC/44.1KHZ STEREO/128K"));
         assert!(!text.contains("generation"));
+    }
+
+    #[test]
+    fn the_active_stream_is_named_while_playing_in_every_layout() {
+        let theme = Theme::default();
+        let mut app = playing_app();
+        app.settings.quality = crate::api::Quality::Low;
+        let station = app.now.as_mut().unwrap();
+        station.stream_hls = "https://hls.example.com/playlist.m3u8".into();
+        app.playback.stream = app.preferred_stream();
+        app.playback.codec = Some("aac".into());
+        app.playback.samplerate = Some(22_050);
+        app.playback.bitrate = Some(64_000);
+        // Tall panel: its own telemetry line.
+        let (text, _) = render_text(&mut app, 120, 40);
+        assert!(
+            text.contains("STREAMING :: HLS 64K ▪ AAC/22.05KHZ/64K"),
+            "{text}"
+        );
+        // Narrow panel: the values ride beside the transport keys.
+        let (text, _) = render_text(&mut app, 60, 24);
+        assert!(text.contains("[▶|]  HLS 64K ▪ AAC/22.05KHZ/64K"), "{text}");
+        // Compact footer: after the station name.
+        let (text, _) = render_text(&mut app, 80, 18);
+        assert!(text.contains("▶  Record · HLS 64k"), "{text}");
+        // A fallback says so, in the warning color.
+        app.playback.stream = app
+            .now
+            .as_ref()
+            .unwrap()
+            .streams(crate::api::Quality::Standard)
+            .into_iter()
+            .next();
+        let (text, buffer) = render_text(&mut app, 120, 40);
+        assert!(
+            text.contains("STREAMING :: DIRECT 96K FALLBACK ▪"),
+            "{text}"
+        );
+        assert!(
+            buffer
+                .content()
+                .iter()
+                .any(|cell| cell.symbol() == "F" && cell.fg == theme.warn)
+        );
+        let (text, _) = render_text(&mut app, 80, 18);
+        assert!(text.contains("▶  Record · direct 96k fallback"), "{text}");
+        // Stopped: no stream is named.
+        app.playback = Default::default();
+        app.now = None;
+        let (text, _) = render_text(&mut app, 80, 18);
+        assert!(!text.contains("direct") && !text.contains("HLS"));
     }
 
     #[test]
@@ -2819,6 +2963,49 @@ mod tests {
         assert_eq!((tall.width(), tall.height()), (300, 600));
         let same = fill_crop(&square, 0, 10);
         assert_eq!((same.width(), same.height()), (600, 600));
+    }
+
+    #[test]
+    fn iterm2_draws_pictures_with_its_own_protocol() {
+        use ProtocolType::{Halfblocks, Iterm2, Kitty, Sixel};
+        assert_eq!(protocol_for(Kitty, true), Iterm2, "kitty answer in iTerm2");
+        assert_eq!(protocol_for(Sixel, true), Iterm2);
+        assert_eq!(protocol_for(Halfblocks, true), Halfblocks, "no cell size");
+        assert_eq!(protocol_for(Kitty, false), Kitty, "kitty and Ghostty");
+        assert_eq!(protocol_for(Sixel, false), Sixel);
+    }
+
+    #[test]
+    fn iterm2_pictures_fill_the_cover_cells_at_twice_the_cell_size() {
+        let mut picker = Picker::halfblocks();
+        picker.set_protocol_type(ProtocolType::Iterm2);
+        let font = picker.font_size();
+        let mut graphics = Graphics {
+            queried: true,
+            picker: Some(picker),
+            cached: None,
+        };
+        let mut app = playing_app();
+        app.cover_mode = CoverMode::Sharp;
+        app.cover = Some(crate::cover::tests::cover("https://example.com/a.jpg"));
+        let mut terminal = Terminal::new(TestBackend::new(80, 40)).unwrap();
+        terminal
+            .draw(|frame| render(frame, &mut app, &Theme::default(), &mut graphics))
+            .unwrap();
+        let Some((_, area, Protocol::ITerm2(picture))) = &graphics.cached else {
+            panic!("no iTerm2 picture");
+        };
+        let sized = format!(
+            ";width={};height={};preserveAspectRatio=0;",
+            area.width, area.height
+        );
+        assert!(picture.data.contains(&sized), "sized in cells, not px");
+        // The PNG signature and IHDR chunk are 24 bytes, 32 base64 digits.
+        let mut header = b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR".to_vec();
+        header.extend((u32::from(area.width) * u32::from(font.width) * 2).to_be_bytes());
+        header.extend((u32::from(area.height) * u32::from(font.height) * 2).to_be_bytes());
+        let payload = picture.data.rsplit(':').next().unwrap();
+        assert_eq!(&payload[..32], crate::songs::base64(&header));
     }
 
     #[test]

@@ -16,6 +16,8 @@ pub struct Settings {
     pub songs: Vec<crate::songs::Song>,
     /// Cover detail in the now-playing panel.
     pub cover: crate::cover::CoverMode,
+    /// Which stream a station plays first.
+    pub quality: crate::api::Quality,
 }
 
 impl Default for Settings {
@@ -25,6 +27,7 @@ impl Default for Settings {
             volume: 65,
             songs: Vec::new(),
             cover: crate::cover::CoverMode::default(),
+            quality: crate::api::Quality::default(),
         }
     }
 }
@@ -94,7 +97,9 @@ mod tests {
         let mut settings = Settings::load(&path).unwrap();
         assert!(settings.songs.is_empty());
         assert_eq!(settings.cover, crate::cover::CoverMode::Pixel);
+        assert_eq!(settings.quality, crate::api::Quality::Standard);
         settings.cover = crate::cover::CoverMode::Fine;
+        settings.quality = crate::api::Quality::High;
         settings.songs.push(crate::songs::Song {
             artist: "Артист".into(),
             song: "Песня".into(),
@@ -105,15 +110,26 @@ mod tests {
         let loaded = Settings::load(&path).unwrap();
         assert_eq!(loaded.songs, settings.songs);
         assert_eq!(loaded.cover, crate::cover::CoverMode::Fine);
+        assert_eq!(loaded.quality, crate::api::Quality::High);
+        assert!(
+            fs::read_to_string(&path)
+                .unwrap()
+                .contains(r#""quality": "high""#)
+        );
         assert_eq!(loaded.favorites, BTreeSet::from([3]));
     }
     #[test]
-    fn an_unknown_cover_mode_falls_back_to_pixel() {
+    fn unknown_cover_and_quality_names_fall_back_to_defaults() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("settings.json");
-        fs::write(&path, r#"{"volume":40,"cover":"hologram"}"#).unwrap();
+        fs::write(
+            &path,
+            r#"{"volume":40,"cover":"hologram","quality":"lossless"}"#,
+        )
+        .unwrap();
         let settings = Settings::load(&path).unwrap();
         assert_eq!(settings.cover, crate::cover::CoverMode::Pixel);
+        assert_eq!(settings.quality, crate::api::Quality::Standard);
         assert_eq!(settings.volume, 40);
     }
     #[test]

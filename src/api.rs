@@ -284,21 +284,135 @@ pub struct Catalog {
     pub tags: Vec<Genre>,
 }
 
+/// Where a stream comes from and which codec it carries. Every kind plays:
+/// AAC-LC in full, HE-AAC as its AAC-LC core (half the sample rate, without
+/// the reconstructed highs or parametric stereo), which is what the low
+/// qualities trade for bandwidth.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamKind {
     /// `stream_320`: direct ADTS AAC-LC, ~96 kbps (the field name is historic).
     Main,
-    /// `stream_hls`: HLS playlist; the AAC-LC variant is picked when played natively.
+    /// `stream_hls`, its AAC-LC variant (`mp4a.40.2`), ~112 kbps.
     Hls,
-    /// `stream_128`: direct HE-AAC (SBR).
+    /// `stream_hls`, its HE-AAC variant (`mp4a.40.5`), ~64 kbps.
+    HlsHe,
+    /// `stream_hls`, its HE-AACv2 variant (`mp4a.40.29`), ~32 kbps; the core is mono.
+    HlsHeV2,
+    /// `stream_128` when it differs from `stream_320`: direct HE-AAC, ~64 kbps.
     High,
-    /// `stream_64`: direct HE-AACv2 (SBR + parametric stereo).
+    /// `stream_64`: direct HE-AAC, 64 or 32 kbps depending on the station.
     Low,
 }
 
-/// One playable stream with the API field it came from, so each engine can
-/// filter the fallback list by what it can actually decode.
-#[derive(Debug, Clone)]
+impl StreamKind {
+    /// How the player names this stream on screen.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Main => "direct 96k",
+            Self::Hls => "HLS 112k",
+            Self::HlsHe => "HLS 64k",
+            Self::HlsHeV2 => "HLS 32k",
+            Self::High => "direct 64k",
+            Self::Low => "direct low",
+        }
+    }
+
+    /// The codec a master playlist names this variant by; `None` for direct streams.
+    pub fn hls_codec(self) -> Option<&'static str> {
+        match self {
+            Self::Hls => Some("mp4a.40.2"),
+            Self::HlsHe => Some("mp4a.40.5"),
+            Self::HlsHeV2 => Some("mp4a.40.29"),
+            Self::Main | Self::High | Self::Low => None,
+        }
+    }
+}
+
+/// How much bandwidth a station may use, highest first. Saved in
+/// `settings.json` as `"quality"` and stepped down with `b`, wrapping from
+/// `lowest` to `high`. Each quality leads with one stream and falls back to
+/// the nearest others.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Quality {
+    /// HLS AAC-LC, ~112 kbps.
+    High,
+    /// Direct AAC-LC, ~96 kbps: starts fastest, closest to live.
+    #[default]
+    Standard,
+    /// HLS HE-AAC played as its core, ~64 kbps: duller highs.
+    Low,
+    /// HLS HE-AACv2 played as its core, ~32 kbps: mono and duller still.
+    Lowest,
+}
+
+impl Quality {
+    pub const ALL: [Self; 4] = [Self::High, Self::Standard, Self::Low, Self::Lowest];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::High => "high",
+            Self::Standard => "standard",
+            Self::Low => "low",
+            Self::Lowest => "lowest",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|quality| quality.name() == value)
+    }
+
+    /// One step less bandwidth, wrapping from `lowest` back to `high`.
+    pub fn next(self) -> Self {
+        let index = Self::ALL
+            .iter()
+            .position(|quality| *quality == self)
+            .unwrap_or(0);
+        Self::ALL[(index + 1) % Self::ALL.len()]
+    }
+
+    /// The streams this quality tries, in order. The low qualities stay low
+    /// as long as they can and end with the direct AAC-LC stream.
+    fn order(self) -> &'static [StreamKind] {
+        use StreamKind::*;
+        match self {
+            Self::High => &[Hls, Main],
+            Self::Standard => &[Main, Hls],
+            Self::Low => &[HlsHe, High, Low, Main],
+            Self::Lowest => &[HlsHeV2, Low, High, HlsHe, Main],
+        }
+    }
+
+    /// The stream this quality plays first.
+    pub fn kind(self) -> StreamKind {
+        self.order()[0]
+    }
+}
+
+impl serde::Serialize for Quality {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.name())
+    }
+}
+
+/// An unknown name falls back to the default instead of making the whole
+/// settings file unreadable.
+impl<'de> serde::Deserialize<'de> for Quality {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        let name = <String as serde::Deserialize>::deserialize(deserializer)?;
+        Ok(Self::parse(&name).unwrap_or_default())
+    }
+}
+
+/// One stream to play: the API field it came from and, for HLS, which
+/// variant of the master playlist to pick.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Stream {
     pub kind: StreamKind,
     pub url: String,
@@ -331,18 +445,26 @@ impl Station {
         .map(|url| url.as_str())
     }
 
-    // Every stream in priority order; the player falls back down the list when
-    // a host is unreachable (stream_320/128/64 share one host, HLS lives on
-    // another). Duplicate URLs are skipped: retrying the same one is pointless.
-    pub fn streams(&self) -> Vec<Stream> {
+    // The streams `quality` tries, in fallback order; the player moves down
+    // the list when a host is unreachable (stream_320/128/64 share one host,
+    // HLS lives on another). A direct URL is tried once, and a direct HE field
+    // that repeats `stream_320` is that AAC-LC stream, not a low one. HLS
+    // variants share the playlist URL and differ by kind.
+    pub fn streams(&self, quality: Quality) -> Vec<Stream> {
         let mut collected: Vec<Stream> = Vec::new();
-        for (kind, url) in [
-            (StreamKind::Main, &self.stream_320),
-            (StreamKind::Hls, &self.stream_hls),
-            (StreamKind::High, &self.stream_128),
-            (StreamKind::Low, &self.stream_64),
-        ] {
-            if url.is_empty() || collected.iter().any(|stream| stream.url == *url) {
+        for &kind in quality.order() {
+            let url = match kind {
+                StreamKind::Main => &self.stream_320,
+                StreamKind::Hls | StreamKind::HlsHe | StreamKind::HlsHeV2 => &self.stream_hls,
+                StreamKind::High => &self.stream_128,
+                StreamKind::Low => &self.stream_64,
+            };
+            let repeated = collected.iter().any(|stream| {
+                stream.url == *url && (kind.hls_codec().is_none() || stream.kind == kind)
+            });
+            let lc_copy =
+                matches!(kind, StreamKind::High | StreamKind::Low) && *url == self.stream_320;
+            if url.is_empty() || repeated || lc_copy {
                 continue;
             }
             collected.push(Stream {
@@ -663,26 +785,77 @@ pub(crate) mod tests {
             catalog.stations[0].stream_url(),
             Some("https://example.com/stream.mp3")
         );
-        let mut station = catalog.stations[0].clone();
-        station.stream_hls = "https://example.com/playlist.m3u8".into();
-        station.stream_128 = station.stream_320.clone();
-        station.stream_64 = "https://example.com/stream64.aacp".into();
-        let streams = station.streams();
+    }
+
+    #[test]
+    fn each_quality_leads_with_its_stream_and_falls_back_to_the_nearest() {
+        use StreamKind::*;
+        // Most stations look like this: stream_128 repeats stream_320.
+        let mut station = Station {
+            id: 1,
+            prefix: "r".into(),
+            title: "R".into(),
+            tooltip: String::new(),
+            stream_64: "https://d.example/r64.aacp".into(),
+            stream_128: "https://d.example/r96.aacp".into(),
+            stream_320: "https://d.example/r96.aacp".into(),
+            stream_hls: "https://h.example/r/playlist.m3u8".into(),
+            icon_fill: String::new(),
+            genres: Vec::new(),
+        };
+        let plan = |station: &Station, quality| {
+            station
+                .streams(quality)
+                .into_iter()
+                .map(|stream| (stream.kind, stream.url))
+                .collect::<Vec<_>>()
+        };
+        let direct = |name: &str| format!("https://d.example/{name}.aacp");
+        let hls = "https://h.example/r/playlist.m3u8".to_owned();
         assert_eq!(
-            streams
-                .iter()
-                .map(|stream| stream.url.as_str())
-                .collect::<Vec<_>>(),
+            plan(&station, Quality::Standard),
+            [(Main, direct("r96")), (Hls, hls.clone())]
+        );
+        assert_eq!(
+            plan(&station, Quality::High),
+            [(Hls, hls.clone()), (Main, direct("r96"))]
+        );
+        // stream_128 repeats stream_320 here: it is the AAC-LC stream, not a
+        // low one, so the low qualities skip it and keep stream_64.
+        assert_eq!(
+            plan(&station, Quality::Low),
             [
-                "https://example.com/stream.mp3",
-                "https://example.com/playlist.m3u8",
-                "https://example.com/stream64.aacp",
+                (HlsHe, hls.clone()),
+                (Low, direct("r64")),
+                (Main, direct("r96"))
             ]
         );
-        assert_eq!(streams[0].kind, StreamKind::Main);
-        assert_eq!(streams[1].kind, StreamKind::Hls);
-        // The duplicate 128k URL was skipped, so the low stream follows HLS.
-        assert_eq!(streams[2].kind, StreamKind::Low);
+        station.stream_128 = direct("r64");
+        station.stream_64 = direct("r32");
+        assert_eq!(
+            plan(&station, Quality::Lowest),
+            [
+                (HlsHeV2, hls.clone()),
+                (Low, direct("r32")),
+                (High, direct("r64")),
+                (HlsHe, hls.clone()),
+                (Main, direct("r96"))
+            ]
+        );
+        // Without HLS every quality still plays what the station has.
+        station.stream_hls.clear();
+        assert_eq!(plan(&station, Quality::High), [(Main, direct("r96"))]);
+        assert_eq!(plan(&station, Quality::Low)[0], (High, direct("r64")));
+        assert_eq!(
+            Quality::ALL.map(Quality::next),
+            [
+                Quality::Standard,
+                Quality::Low,
+                Quality::Lowest,
+                Quality::High
+            ]
+        );
+        assert_eq!(Quality::ALL.map(Quality::kind), [Hls, Main, HlsHe, HlsHeV2]);
     }
 
     #[test]

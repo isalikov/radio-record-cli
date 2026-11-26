@@ -2,6 +2,49 @@
 
 All notable changes to this project are documented here.
 
+## [Unreleased]
+
+### Added
+
+- Stream quality on `b`, one step down each press: `high` (HLS AAC-LC,
+  112 kbps), `standard` (direct AAC-LC, 96 kbps, the default), `low` (HLS
+  HE-AAC, 64 kbps), and `lowest` (HLS HE-AACv2, 32 kbps), then back to
+  `high`. The low qualities keep playing on slow connections. The choice is
+  saved as `"quality"` in `settings.json`; switching while a station is on
+  reconnects it at the new quality.
+- HE-AAC streams play as their AAC-LC core at 22.05 kHz: duller than full
+  HE-AAC, and mono at 32 kbps. Each quality falls back to the nearest other
+  streams, including the direct 64 and 32 kbps ones.
+- The stream on air is named during playback: `STREAMING :: HLS 64K ▪ AAC/…`
+  in the now-playing panel and `▶  Record · HLS 64k` in the compact footer,
+  with `FALLBACK` in yellow when the preferred stream failed to load.
+
+### Changed
+
+- The audio ring holds about 20 seconds instead of 3, as a cushion against
+  network dips. HLS joins 15 seconds behind the live edge and downloads that
+  backlog at network speed; the direct stream's connect burst (about 64 KB)
+  now fits too. Start-up still waits for only 0.3 seconds.
+- After the ring runs dry, playback waits for 2 seconds of audio instead of
+  0.3, so a slow connection gives fewer, longer pauses instead of stutter.
+- The `SIG` meter lights its bars at 0.5, 2, 5, and 10 seconds of queued audio.
+
+### Fixed
+
+- Diagnostics named the direct stream `320k` after its API field; it is a
+  96 kbps stream and now reads `direct 96k`.
+- Sample rates show without rounding: `22.05kHz`, not `22.1kHz`.
+- `sharp` covers were empty in iTerm2: iTerm2 answers the kitty graphics
+  query, but leaves kitty pictures placed through unicode placeholders blank.
+  iTerm2 now always gets its own image protocol, sized in cells rather than
+  pixels (which iTerm2 drew at half size on Retina screens) and sent at twice
+  the cell resolution for sharp Retina output. iTerm2 3.7 may ask once to
+  allow terminal-initiated display.
+
+### Removed
+
+- The `HE-AAC streams are unsupported` error: every station plays.
+
 ## [v3.3.1] - 2026-10-14
 
 ### Fixed

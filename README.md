@@ -21,6 +21,7 @@
   <a href="#features">Features</a> ·
   <a href="#keyboard">Keyboard</a> ·
   <a href="#liked-songs">Liked songs</a> ·
+  <a href="#stream-quality">Stream quality</a> ·
   <a href="#configuration">Configuration</a> ·
   <a href="#troubleshooting">Troubleshooting</a> ·
   <a href="#support">Support</a>
@@ -43,7 +44,8 @@ comes on, `v` to see every song you saved, and `?` for all keys.
 | **Every station** | The full Radio Record catalog, grouped by genre, with favorites on `f`. |
 | **Native audio** | A built-in AAC decoder plays through CoreAudio or ALSA. No ffmpeg, mpv, or VLC. |
 | **Spectrum visualizer** | 96 frequency bands from a real FFT of the audio you hear, with falling peak caps. |
-| **Now playing** | Cover art (pixel art, or real images on kitty, sixel, and iTerm2), track progress, stream format. |
+| **Now playing** | Cover art (pixel art, or real images on kitty, sixel, and iTerm2), track progress, the stream on air and its format. |
+| **Stream quality** | `b` picks 112, 96, 64, or 32 kbps; the low ones keep playing on slow connections. A 20-second buffer rides out network dips. |
 | **Track vault** | `l` saves the song on air. The vault links each song to YouTube Music, Spotify, Yandex Music, and Apple Music. |
 | **Track history** | The INTERCEPT LOG shows what the station played before. |
 | **Account sync** | Sign in to sync favorite stations with your Radio Record account. |
@@ -108,6 +110,7 @@ Settings live in `~/.config/radio-record` by default; the script honours the sam
 | v | Open / close the track vault (liked songs) |
 | i | Show / hide recent tracks |
 | c | Cover detail: off → chunky → pixel → fine → sharp (saved) |
+| b | Stream quality one step down: 112 → 96 → 64 → 32 kbps, then back to 112 (saved) |
 | d | Toggle diagnostics overlay |
 | a | Open account, sign in, sync favorites, or sign out |
 | PgUp / PgDn, Home / End | Scroll stations |
@@ -173,6 +176,39 @@ Volume, play/pause, stop, `l`, and quit keep working in the vault and card.
 Liked songs are stored locally in `settings.json` and are not synced to the
 Radio Record account.
 
+## Stream quality
+
+`b` changes which network stream the player downloads, one step down at a
+time: high → standard → low → lowest, then back to high. The choice is saved
+as `"quality"` in `settings.json`; an unknown value means `standard`.
+
+| Quality | Stream | Traffic | Sound |
+| --- | --- | --- | --- |
+| `high` | HLS, AAC-LC | 112 kbps, about 50 MB an hour | Full |
+| `standard` (default) | Direct, AAC-LC | 96 kbps, about 43 MB an hour | Full; starts fastest and is closest to live |
+| `low` | HLS, HE-AAC | 64 kbps, about 29 MB an hour | Duller: no highs |
+| `lowest` | HLS, HE-AACv2 | 32 kbps, about 14 MB an hour | Duller and mono |
+
+Pick `low` or `lowest` when the connection cannot keep up: playback pauses
+to buffer (`◉ SYNC` in the header) and the `d` overlay counts underruns.
+The low streams are HE-AAC. The built-in decoder plays their AAC-LC core at
+half the sample rate (22.05 kHz); it does not rebuild the high frequencies
+or, at 32 kbps, the stereo image, so they sound duller than in players that
+decode HE-AAC fully.
+
+Pressing `b` while a station is on reconnects it at the new quality, keeping
+the track and cover on screen and resuming playback if it was paused. It
+does not reconnect when the station already plays the stream the new quality
+prefers. The panel border shows the choice, such as `◈ QUALITY LOW · HLS 64K`.
+
+The stream on air is named in the now-playing panel
+(`STREAMING :: HLS 64K ▪ AAC/22.05KHZ STEREO/64K`) and, in short windows,
+after the station name (`▶  Record · HLS 64k`). When a quality's own stream
+fails to load, the player falls back to the nearest others: `high` and
+`standard` to each other; `low` and `lowest` to the station's direct HE-AAC
+streams (64 or 32 kbps), the other low HLS stream, and finally the direct
+96 kbps stream. A fallback stream is marked `FALLBACK` in yellow.
+
 ## Account and favorites sync
 
 Press `a` to open your Radio Record account. Enter your email and password,
@@ -229,7 +265,7 @@ short windows to leave room for stations. Truecolor terminals show the full pale
 Windows at least 21 rows tall show the now-playing panel; 31 rows and more
 give it a larger cover, a metadata line, and a separate telemetry line.
 Shorter windows keep a compact footer with the visualizer above the status
-line. The top line shows the playback state (`◉ ON AIR`, `◉ SYNC 42%`,
+line, which names the stream on air after the station (`▶  Record · HLS 64k`). The top line shows the playback state (`◉ ON AIR`, `◉ SYNC 42%`,
 `▮▮ HOLD`, `! FAULT`, or `○ STANDBY`), the favorite station count, the
 liked-song count (`♥ 3`), and uptime.
 
@@ -248,6 +284,11 @@ in `settings.json`:
 time it is on, and falls back to `pixel` when none is offered or while a popup
 is open. Use it only in a terminal emulator: a terminal that never answers the
 query freezes the player for 2 seconds and swallows the next key.
+iTerm2 always gets its own image protocol, and iTerm2 3.7 may ask "Allow
+Terminal-Initiated Display?" the first time: tick "Remember my choice" and
+answer Yes, or it asks again for every new cover. While the question is open,
+iTerm2 holds the player's screen output and the player stops responding to
+keys. Answering No leaves the cover area empty.
 `RADIO_RECORD_COVER` picks the mode for one session without saving it; an
 unknown value keeps the saved setting with a note on stderr, and an unknown
 `"cover"` in `settings.json` falls back to `pixel`.
@@ -269,8 +310,9 @@ caps the mode at `calm`; an unknown value means `full` with a note on stderr.
 
 ## Audio and settings
 
-Native audio uses HTTP (rustls), a pure-Rust AAC-LC decoder (Symphonia),
-and a fixed-capacity ring feeding CoreAudio or ALSA. The engine preserves the
+Native audio uses HTTP (rustls), a pure-Rust AAC decoder (Symphonia; HE-AAC
+streams play as their AAC-LC core), and a fixed-capacity ring feeding
+CoreAudio or ALSA. The engine preserves the
 current output-device format, including sample rates below the radio stream
 and mono headset outputs. On macOS it reads the hardware clock rather than
 assuming the virtual stream format has the same rate. Matching rates pass
@@ -282,16 +324,22 @@ are reported as audio-device errors.
 
 Native pause silences output on the next callback and discards queued audio,
 including the resampler's look-ahead and filter history. The reader keeps draining the radio;
-resume buffers fresh audio. HLS rejoins recent published segments, so its
-normal segment delay still applies.
+resume buffers fresh audio. HLS rejoins 15 seconds behind the live edge.
 
+The ring holds about 20 seconds of audio (43 at the 22.05 kHz of the low
+qualities) and is the cushion against network dips. It fills faster than real
+time without delaying the start: the direct stream's server sends about 64 KB
+at once on connect (about 5 seconds at 96 kbps, 16 at 32 kbps), and HLS joins
+15 seconds behind the live edge and downloads that backlog at network speed.
 HLS segments are fed completely as ring space becomes available; they are
 not truncated to the ring's capacity. The output waits for 0.3 seconds of
-audio at startup and after starvation. Its buffering percentage measures
-progress toward that threshold. Cache fill, underruns, and audio levels come
+audio at startup and after a pause. After the ring runs dry it waits for
+2 seconds, so a connection that cannot keep up gives fewer, longer pauses
+instead of constant stutter. The buffering percentage measures progress
+toward the current threshold. Cache fill, underruns, and audio levels come
 from the output callback, so they follow consumption even while HTTP is idle.
 
-Failed URLs fall through to the next supported stream, with three rounds
+Failed URLs fall through to the quality's next stream, with three rounds
 and a two-second delay between rounds. Each URL change resets the ring,
 output sample rate, and telemetry. Stalled HLS playlists and repeated corrupt
 segments trigger fallback instead of leaving playback silent indefinitely.
@@ -318,11 +366,12 @@ terminal font.
 The now-playing panel takes its window name from the station (`record.sh`,
 or `music.sh` when stopped). Its top border carries a `[LIVE]` badge and a
 ten-step volume meter; its bottom border carries the playback status and,
-while loading or playing, `SIG ▂▃▅▇ BUF 2.4s`, four bars lit by how much of
-the three-second ring is queued. Inside are the track cover, title and
+while loading or playing, `SIG ▂▃▅▇ BUF 12.4s`, four bars lit at 0.5, 2, 5,
+and 10 seconds of queued audio. Inside are the track cover, title and
 artist, the genre, station number, and airing time on tall panels, a neon
-progress bar, previous/play-pause/next keys, and the stream format
-(`STREAMING :: AAC/44.1KHZ STEREO/96K`). The visualizer sits beside them at
+progress bar, previous/play-pause/next keys, and the stream on air with its
+format (`STREAMING :: HLS 112K ▪ AAC/44.1KHZ STEREO/112K`; see
+[Stream quality](#stream-quality)). The visualizer sits beside them at
 full cover height, or below them when the panel is narrow. The keys mirror
 F7/F8/F9; there is no mouse support. Live radio has no track length,
 so the bar shows time since the track started on air and fills against the
@@ -345,16 +394,16 @@ engine decodes AAC in-process. macOS system media controls belong to radio-recor
 and remain available across station changes. Volume is software gain
 and does not change system volume.
 
-Favorites, volume, liked songs, and the cover mode are saved atomically in `~/.config/radio-record/settings.json`.
+Favorites, volume, liked songs, the cover mode, and the stream quality are saved atomically in `~/.config/radio-record/settings.json`.
 Directory precedence: `RADIO_RECORD_CONFIG_DIR`, `$XDG_CONFIG_HOME/radio-record`,
 `~/.config/radio-record`. Corrupt settings are reported rather than overwritten.
 
 History and current track metadata refresh every 15 seconds. The API may lag
 behind audio, especially after pausing. `RADIO_RECORD_BASE_URL` overrides the API
 base URL for development. Requests time out after 15 seconds.
-Stream priority: `stream_320`, then the AAC-LC variant of `stream_hls`. If a
-stream fails to load, the player tries the next distinct supported URL before
-reporting an error. The HE-AAC `stream_128` and `stream_64` entries are skipped.
+Stream priority follows the stream quality (see
+[Stream quality](#stream-quality)). If a stream fails to load, the player
+tries the next distinct URL before reporting an error.
 
 ## Troubleshooting
 
@@ -371,13 +420,14 @@ output mixes both channels. On macOS the hardware clock is read separately
 from the virtual stream format, so a call's lower rate is preserved. Bluetooth
 headphones can sound less clear while their microphone is active.
 
-**`HE-AAC streams are unsupported · select another station`** — the station
-only offers streams the built-in AAC-LC decoder cannot play. Select a station
-with a direct AAC-LC stream or an AAC-LC HLS variant.
+**Playback keeps stopping with `◉ SYNC`** — the connection delivers less
+than the stream needs. Press `b` until the quality is `low` (64 kbps) or
+`lowest` (32 kbps). After a dry ring the player buffers 2 seconds before it
+plays again; the `d` overlay shows the cushion and counts underruns.
 
 **`<host> unreachable · Enter to retry`** — the player could not open any of
-the station's streams. radio-record falls back from the direct streams to HLS and
-then retries the whole list two more times, 2 seconds apart, before showing
+the station's streams. radio-record falls back to the quality's other streams
+(direct and HLS live on different hosts) and then retries the whole list two more times, 2 seconds apart, before showing
 this; the message names the hosts that failed. The HLS host is a rotating DNS
 pool, so a retry can land on an address that works. A VPN or split-tunnel rule
 that sends some of these addresses around the tunnel is a common cause: route
@@ -393,8 +443,7 @@ Debian/Ubuntu). Release binaries need only the ALSA runtime library
 (`libasound.so.2`); macOS uses the built-in CoreAudio framework. HTTP, TLS,
 and AAC decoding are compiled into the binary.
 
-Audio uses the built-in engine: direct AAC-LC streams and the AAC-LC variant
-of HLS. HE-AAC-only stations are unsupported and report a clear error.
+Audio uses the built-in engine: AAC-LC in full, HE-AAC as its AAC-LC core.
 
 The Rust toolchain is pinned in `mise.toml`. With [mise](https://mise.jdx.dev) installed,
 `mise install` in this directory fetches the right `cargo`, `rustfmt`, and `clippy`.

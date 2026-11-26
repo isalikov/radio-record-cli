@@ -1,1 +1,1 @@
-Fixtures for radio-record tests, recorded from Radio Record public streams (https://www.radiorecord.ru) on 2026-10-08. Short samples for decoder testing only.
+Fixtures for radio-record tests, recorded from Radio Record public streams (https://www.radiorecord.ru) on 2026-10-08; `32/` (one HE-AACv2 HLS segment) on 2026-11-26. Short samples for decoder testing only.
