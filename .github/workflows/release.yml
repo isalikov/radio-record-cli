@@ -20,7 +20,10 @@ jobs:
           - os: macos-15-intel
             target: x86_64-apple-darwin
             archive: radio-record-macos-x86_64.tar.gz
-          - os: macos-14
+          # Apple Silicon. A pinned macos-NN label stops working once GitHub
+          # retires that image (macos-14 did); the binary still targets
+          # macOS 11 whatever the runner's version.
+          - os: macos-latest
             target: aarch64-apple-darwin
             archive: radio-record-macos-aarch64.tar.gz
     runs-on: ${{ matrix.os }}

@@ -11,6 +11,12 @@ have() {
 	command -v "$1" >/dev/null 2>&1
 }
 
+# A cargo on PATH may still be unusable: a mise or rustup shim with no
+# toolchain selected for the current directory fails when it runs.
+cargo_works() {
+	have cargo && cargo --version >/dev/null 2>&1
+}
+
 repo=${RADIO_RECORD_REPO:-isalikov/radio-record-cli}
 version=${RADIO_RECORD_VERSION:-latest}
 prefix=${RADIO_RECORD_PREFIX:-$HOME/.local}
@@ -58,13 +64,15 @@ if curl -fsSL "$asset_url" -o "$tmp_dir/$asset"; then
 	install -m 755 "$tmp_dir/radio-record" "$bin_dir/radio-record"
 	printf '%s\n' "Installed to $bin_dir/radio-record"
 else
-	if have cargo; then
+	if cargo_works; then
 		printf '%s\n' "Release asset not found, building from source with cargo"
 		if [ "$platform" = linux ]; then
 			printf '%s\n' "Linux source builds need ALSA headers and pkg-config (Debian/Ubuntu: sudo apt install libasound2-dev pkg-config)"
 		fi
 		cargo install --locked --git "https://github.com/$repo.git" --force --root "$prefix" radio-record
 		printf '%s\n' "Installed to $bin_dir/radio-record"
+	elif have cargo; then
+		die "No release asset found at $asset_url, and cargo is on PATH but does not run (with mise: mise use -g rust@stable)"
 	else
 		die "No release asset found at $asset_url and cargo is not installed"
 	fi

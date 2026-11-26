@@ -2,7 +2,7 @@
 
 All notable changes to this project are documented here.
 
-## [Unreleased]
+## [v3.4.1] - 2026-11-26
 
 ### Added
 
@@ -40,6 +40,11 @@ All notable changes to this project are documented here.
   pixels (which iTerm2 drew at half size on Retina screens) and sent at twice
   the cell resolution for sharp Retina output. iTerm2 3.7 may ask once to
   allow terminal-initiated display.
+- The Apple Silicon release archive is built again: its `macos-14` runner was
+  retired, which cancelled the build and left the release unpublished.
+- The installer checks that `cargo` actually runs before building from
+  source, and explains a mise or rustup shim with no toolchain selected
+  instead of failing inside it.
 
 ### Removed
 
